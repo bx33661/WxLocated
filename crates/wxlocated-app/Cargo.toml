@@ -1,0 +1,29 @@
+[package]
+name = "wxlocated-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wxlocated-app"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = { version = "0.9.0", features = ["tree-sitter-javascript", "tree-sitter-css", "tree-sitter-html", "tree-sitter-markdown"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+notify = "8"
+async-channel = "2"
+similar = "2"
+serde_json = "1.0.154"
+url = "2"
+wxlocated-engine = { version = "1.0.0", path = "../wxlocated-engine" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Only for the dev `snapshot` feature (render_to_image lives here).
+gpui-pre-macos = { version = "=0.3.11", optional = true }
+
+[features]
+# Dev only: render windows to PNG without showing them (see snapshot.rs).
+snapshot = ["dep:gpui-pre-macos", "gpui-pre-macos/test-support"]

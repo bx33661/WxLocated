@@ -1,0 +1,17 @@
+[package]
+name = "wxlocated-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wxlocated"
+path = "src/main.rs"
+
+[dependencies]
+hex = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+wxlocated-engine = { path = "../wxlocated-engine" }

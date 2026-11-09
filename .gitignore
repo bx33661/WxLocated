@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Build output
+*.app
+/dist/
+
+# Release artifacts
+*.dmg
+*.zip
+
+# Local documentation (README remains public)
+/docs/
+*.[mM][dD]
+!/README.md
+
+# Rust
+/target/
