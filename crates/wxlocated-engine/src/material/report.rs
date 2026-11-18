@@ -552,12 +552,31 @@ pub fn confidence_machine_name(confidence: Confidence) -> &'static str {
 /// The per-account directory segment of a cache path (`…/users/<hash>/…`).
 pub fn account_directory(package: &Path) -> Option<String> {
     let components: Vec<String> = package.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-    let index = components.iter().position(|c| c == "users")?;
-    components.get(index + 1).cloned()
+    if let Some(index) = components.iter().rposition(|c| c == "users" || cfg!(windows) && c.eq_ignore_ascii_case("users"))
+        && let Some(account) = components.get(index + 1)
+    {
+        // A Windows profile's C:\\Users\\<name> is not a WeChat account.
+        if components[..index].iter().any(|c| c.eq_ignore_ascii_case("radium")) || !cfg!(windows) {
+            return Some(account.clone());
+        }
+    }
+    components.windows(2).find_map(|pair| {
+        ((pair[0].eq_ignore_ascii_case("WeChat Files") || pair[0].eq_ignore_ascii_case("xwechat_files"))
+            && !["Applet", "all_users"].iter().any(|name| pair[1].eq_ignore_ascii_case(name)))
+            .then(|| pair[1].clone())
+    })
 }
 
-/// The installed WeChat's version (macOS).
+/// The installed WeChat client's version, when available.
 pub fn wechat_client_version() -> Option<String> {
+    #[cfg(windows)]
+    { crate::platform::wechat_version() }
+    #[cfg(not(windows))]
+    { wechat_macos_version() }
+}
+
+#[cfg(not(windows))]
+fn wechat_macos_version() -> Option<String> {
     for path in ["/Applications/WeChat.app", "/Applications/微信.app"] {
         let plist = Path::new(path).join("Contents/Info.plist");
         if let Ok(plist::Value::Dictionary(info)) = plist::Value::from_file(&plist)
@@ -597,6 +616,22 @@ pub fn inspect_app(app: &Miniapp) -> Vec<Inspection> {
 mod tests {
     use super::*;
     use crate::scan::Generation;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn macos_profile_is_not_a_wechat_account() {
+        assert_eq!(account_directory(Path::new("/Users/desktop/Library/Caches/applet/app.wxapkg")), None);
+        assert_eq!(account_directory(Path::new("/Users/desktop/Library/radium/users/account-hash/applet/app.wxapkg")).as_deref(), Some("account-hash"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identifies_wechat_accounts_without_redacting_the_windows_profile_as_an_account() {
+        assert_eq!(account_directory(Path::new(r"C:\Users\desktop\Documents\WeChat Files\wxid_account\Applet\wx0123456789abcdef\1\__APP__.wxapkg")).as_deref(), Some("wxid_account"));
+        assert_eq!(account_directory(Path::new(r"C:\Users\desktop\AppData\Roaming\Tencent\xwechat\radium\users\account-hash\applet\packages\app.wxapkg")).as_deref(), Some("account-hash"));
+        assert_eq!(account_directory(Path::new(r"C:\Users\desktop\Documents\xwechat_files\all_users\applet\app.wxapkg")), None);
+        assert_eq!(account_directory(Path::new(r"C:\Users\desktop\Documents\WeChat Files\Applet\app.wxapkg")), None);
+    }
 
     #[test]
     fn plugin_absence_restoration_and_blocked_precedence() {

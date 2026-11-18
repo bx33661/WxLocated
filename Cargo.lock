@@ -1436,6 +1436,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "directories"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16f5094c54661b38d03bd7e50df373292118db60b585c08a411c6d840017fe7d"
+dependencies = [
+ "dirs-sys 0.5.0",
+]
+
+[[package]]
 name = "dirs"
 version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8527,6 +8536,7 @@ version = "1.0.0"
 dependencies = [
  "async-channel",
  "chrono",
+ "embed-resource",
  "gpui-kit",
  "gpui-pre-macos",
  "image",
@@ -8541,6 +8551,7 @@ dependencies = [
 name = "wxlocated-cli"
 version = "1.0.0"
 dependencies = [
+ "embed-resource",
  "hex",
  "serde",
  "serde_json",
@@ -8553,6 +8564,7 @@ name = "wxlocated-engine"
 version = "1.0.0"
 dependencies = [
  "aes 0.9.4",
+ "directories",
  "hex",
  "libc",
  "pbkdf2 0.13.0",
@@ -8565,6 +8577,8 @@ dependencies = [
  "thiserror 2.0.21",
  "unicode-normalization",
  "uuid",
+ "windows-sys 0.61.2",
+ "winreg",
 ]
 
 [[package]]

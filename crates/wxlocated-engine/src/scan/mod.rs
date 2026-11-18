@@ -2,8 +2,7 @@
 //! cached version is current, older versions, and plugin code cached under
 //! provider AppIDs. Read-only; package bodies are not unpacked.
 //!
-//! The search paths are the macOS WeChat cache layout; Windows locations are
-//! added in the Windows phase.
+//! Search roots follow each platform's WeChat layout and user configuration.
 
 mod metadata;
 
@@ -17,6 +16,7 @@ use crate::archive::natural_compare;
 
 /// Fixed candidates stay in the report even when absent. Wildcard candidates
 /// are expanded only when every directory component exists.
+#[cfg(not(windows))]
 pub const DEFAULT_SEARCH_PATHS: &[&str] = &[
     // 3.x sandbox cache
     "~/Library/Containers/com.tencent.xinWeChat/Data/.wxapplet/packages",
@@ -39,6 +39,15 @@ pub const DEFAULT_SEARCH_PATHS: &[&str] = &[
     "~/Library/Containers/*/Data/Library/Application Support/WeChat/Applet/icon",
     "~/Library/Containers/*/Data/Library/Caches/applet/packages",
     "~/Library/Containers/*/Data/Library/Caches/applet/icon",
+];
+
+#[cfg(windows)]
+pub const DEFAULT_SEARCH_PATHS: &[&str] = &[
+    "%APPDATA%/Tencent/WeChat/WechatApp/LocalCache",
+    "%LOCALAPPDATA%/Tencent/WeChat/WechatApp/LocalCache",
+    "%APPDATA%/Tencent/WeChat/XPlugin/Plugins/WMPF/*/Applet",
+    "%APPDATA%/Tencent/xwechat/radium/Applet",
+    "%LOCALAPPDATA%/Tencent/xwechat/radium/Applet",
 ];
 
 /// Each candidate only opens the package index and a few bounded JSON entries,
@@ -127,14 +136,20 @@ struct PackageInfo {
 }
 
 pub fn scan(custom_paths: &[String]) -> Snapshot {
-    let paths: Vec<String> = DEFAULT_SEARCH_PATHS.iter().map(|path| path.to_string()).chain(custom_paths.iter().cloned()).collect();
+    let paths: Vec<String> = DEFAULT_SEARCH_PATHS.iter().map(|path| path.to_string())
+        .chain(crate::platform::wechat_cache_paths())
+        .chain(custom_paths.iter().cloned()).collect();
+    scan_paths(&paths)
+}
+
+fn scan_paths(paths: &[String]) -> Snapshot {
     let mut snapshot = Snapshot::default();
     let mut packages_by_app: Vec<(String, Vec<PackageInfo>)> = Vec::new();
     let mut icons: HashMap<String, (SystemTime, Vec<u8>)> = HashMap::new();
     let mut seen_packages = HashSet::new();
     let started = std::time::Instant::now();
 
-    for root in normalized_roots(&paths) {
+    for root in normalized_roots(paths) {
         match std::fs::metadata(&root) {
             Ok(metadata) if metadata.is_dir() => {}
             _ => {
@@ -414,32 +429,19 @@ fn normalized_roots(paths: &[String]) -> Vec<PathBuf> {
     roots
 }
 
-fn expand_tilde(path: &str) -> String {
-    match path.strip_prefix("~") {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            format!("{home}{rest}")
-        }
-        _ => path.to_string(),
-    }
-}
-
 fn expanded_roots(path: &str) -> Vec<PathBuf> {
-    let expanded = expand_tilde(path);
-    let components: Vec<&str> = expanded.split('/').filter(|c| !c.is_empty()).collect();
-    if !components.contains(&"*") {
-        return vec![PathBuf::from(&expanded)];
+    use std::path::Component;
+    let expanded = crate::platform::expand_path(path);
+    if !expanded.components().any(|component| component.as_os_str() == "*") {
+        return vec![expanded];
     }
-    if !expanded.starts_with('/') {
-        return Vec::new();
-    }
-    let mut candidates = vec![PathBuf::from("/")];
-    for component in components {
-        if component == "*" {
+    let mut candidates = vec![PathBuf::new()];
+    for component in expanded.components() {
+        if matches!(component, Component::Normal(name) if name == "*") {
             candidates = candidates
                 .iter()
                 .flat_map(|parent| {
-                    let mut children: Vec<PathBuf> = std::fs::read_dir(parent)
+                    let mut children: Vec<PathBuf> = std::fs::read_dir(if parent.as_os_str().is_empty() { Path::new(".") } else { parent })
                         .map(|entries| {
                             entries
                                 .filter_map(Result::ok)
@@ -457,7 +459,9 @@ fn expanded_roots(path: &str) -> Vec<PathBuf> {
                 .collect();
         } else {
             candidates =
-                candidates.iter().map(|parent| parent.join(component)).filter(|child| std::fs::metadata(child).is_ok_and(|m| m.is_dir())).collect();
+                candidates.iter().map(|parent| parent.join(component.as_os_str())).filter(|child| {
+                    matches!(component, Component::Prefix(_) | Component::RootDir) || child.is_dir()
+                }).collect();
         }
         if candidates.is_empty() {
             break;
@@ -566,7 +570,7 @@ fn is_main_package(path: &Path) -> bool {
 }
 
 fn is_plugin_package(path: &Path) -> bool {
-    let upper = path.to_string_lossy().to_uppercase();
+    let upper = path.to_string_lossy().replace('\\', "/").to_uppercase();
     upper.contains("PLUGINCODE") || upper.contains("/PLUGINS/") || upper.contains("__PLUGIN__")
 }
 
@@ -591,4 +595,88 @@ fn generation_key(path: &Path, app_id: &str) -> PathBuf {
     };
     let end = if app_index + 1 < components.len() - 1 { app_index + 1 } else { app_index };
     components[..=end].iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("WxLocated 扫描 test {}", crate::export::uuid_string()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn package(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // One ordinary app.js entry, enough to exercise real archive indexing.
+            let name = b"app.js";
+            let body = b"module.exports = {};";
+            let index_size = 4 + 12 + name.len() as u32;
+            let mut bytes = vec![0xbe, 0, 0, 0, 0];
+            bytes.extend(index_size.to_be_bytes());
+            bytes.extend((body.len() as u32).to_be_bytes());
+            bytes.push(0xed);
+            bytes.extend(1u32.to_be_bytes());
+            bytes.extend((name.len() as u32).to_be_bytes());
+            bytes.extend(name);
+            bytes.extend((14 + index_size).to_be_bytes());
+            bytes.extend((body.len() as u32).to_be_bytes());
+            bytes.extend(body);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn scans_account_wildcards_without_mixing_versions_or_plugins() {
+        let fixture = Fixture::new();
+        fixture.package("account A/Applet/wx0123456789abcdef/1/__APP__.wxapkg");
+        let main = fixture.package("account A/Applet/wx0123456789abcdef/2/__APP__.wxapkg");
+        let sub = fixture.package("account A/Applet/wx0123456789abcdef/2/sub.wxapkg");
+        fixture.package("account B/Applet/wx1111111111111111/1/__APP__.wxapkg");
+        fixture.package("account A/Applet/wx2222222222222222/1/PLUGINS/plugin.wxapkg");
+        let pattern = fixture.0.join("*/Applet").to_string_lossy().into_owned();
+        // Duplicate roots and mixed path separators must not duplicate packages.
+        let snapshot = scan_paths(&[pattern, fixture.0.join("account A/Applet").to_string_lossy().into_owned()]);
+        assert_eq!(snapshot.miniapps.len(), 2);
+        assert_eq!(snapshot.diagnostics.total_package_files, 5);
+        let app = snapshot.miniapps.iter().find(|app| app.app_id == "wx0123456789abcdef").unwrap();
+        assert!(crate::platform::paths_equal(&app.main_package, &main));
+        assert_eq!(app.sub_packages.len(), 1);
+        assert!(crate::platform::paths_equal(&app.sub_packages[0], &sub));
+        assert_eq!(snapshot.older_generations[&app.app_id].len(), 1);
+        assert_eq!(snapshot.plugin_generations["wx2222222222222222"].len(), 1);
+        assert_eq!(snapshot.enumeration_errors, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scans_paths_longer_than_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+        let fixture = Fixture::new();
+        let relative = format!("{}/{}/wx0123456789abcdef/1/__APP__.wxapkg", "a".repeat(120), "包".repeat(100));
+        let package = fixture.package(&relative);
+        assert!(package.as_os_str().encode_wide().count() > 260);
+        let snapshot = scan_paths(&[fixture.0.to_string_lossy().into_owned()]);
+        assert_eq!(snapshot.miniapps.len(), 1);
+        assert!(crate::platform::paths_equal(&snapshot.miniapps[0].main_package, &package));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn expands_drive_paths_with_both_separators() {
+        let fixture = Fixture::new();
+        fixture.package("user/Applet/wx0123456789abcdef/1/__APP__.wxapkg");
+        let pattern = fixture.0.join("*/Applet");
+        let native = expanded_roots(&pattern.to_string_lossy());
+        let forward = expanded_roots(&pattern.to_string_lossy().replace('\\', "/"));
+        assert_eq!(native.len(), 1);
+        assert_eq!(native, forward);
+    }
 }

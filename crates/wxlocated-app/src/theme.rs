@@ -141,7 +141,7 @@ pub fn window_options(title: &str, bounds: Bounds<Pixels>, min: Option<Size<Pixe
         titlebar: Some(TitlebarOptions {
             title: Some(title.to_string().into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(18.), px((toolbar_height - 12.) / 2.))),
+            traffic_light_position: cfg!(target_os = "macos").then(|| point(px(18.), px((toolbar_height - 12.) / 2.))),
         }),
         app_owns_titlebar_drag: true,
         window_background: WindowBackgroundAppearance::Blurred,
@@ -151,7 +151,7 @@ pub fn window_options(title: &str, bounds: Bounds<Pixels>, min: Option<Size<Pixe
 }
 
 /// Native buttons start at x=18 and extend to about x=76; keep a 20-point gap.
-pub const TRAFFIC_LIGHTS: f32 = 96.;
+pub const TRAFFIC_LIGHTS: f32 = if cfg!(target_os = "macos") { 96. } else { 12. };
 
 pub fn hex(value: u32) -> Hsla {
     rgb(value).into()

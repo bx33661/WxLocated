@@ -12,13 +12,20 @@ use wxlocated_engine::swift_json::iso8601;
 pub const SCHEMA_VERSION: i64 = 2;
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const ACCESS_HINT: &str =
-    "部分缓存目录无权读取：在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许当前终端或 Agent 宿主应用";
+pub static SCAN_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub const ACCESS_HINT: &str = if cfg!(target_os = "macos") {
+    "部分缓存目录无权读取：在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许当前终端或 Agent 宿主应用"
+} else {
+    "部分缓存目录无权读取：请确认当前用户具有缓存目录的读取权限，或在设置中添加可读取的 Applet 缓存目录"
+};
 
 /// A scan with custom names applied, as the Swift `ScannerViewModel` gives it.
 pub fn scan_cache() -> Snapshot {
     let settings = Settings::load();
-    let mut snapshot = scan::scan(&settings.custom_scan_paths);
+    let paths: Vec<_> = settings.custom_scan_paths.iter().cloned()
+        .chain(SCAN_PATHS.get().into_iter().flatten().cloned()).collect();
+    let mut snapshot = scan::scan(&paths);
     for app in &mut snapshot.miniapps {
         if let Some(name) = settings.custom_app_names.get(&app.app_id) {
             app.name = Some(name.clone());
@@ -150,12 +157,7 @@ pub fn info(args: &[String]) -> Result<Value, Failure> {
 
 /// `~` expanded; relative paths stay relative to the current directory.
 pub fn expand_tilde(path: &str) -> std::path::PathBuf {
-    match path.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            std::path::PathBuf::from(format!("{}{rest}", std::env::var("HOME").unwrap_or_default()))
-        }
-        _ => std::path::PathBuf::from(path),
-    }
+    wxlocated_engine::platform::expand_path(path)
 }
 
 pub fn export(args: &[String]) -> Result<Value, Failure> {

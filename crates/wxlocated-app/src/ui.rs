@@ -303,7 +303,7 @@ pub fn language_for(path: &str) -> &'static str {
 
 /// `~` for the home folder; a long path keeps its end, where folders differ.
 pub fn display_path(path: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = wxlocated_engine::platform::home_dir().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
     let path = match path.strip_prefix(&home) {
         Some(rest) if !home.is_empty() => format!("~{rest}"),
         _ => path.to_string(),
@@ -313,6 +313,19 @@ pub fn display_path(path: &str) -> String {
         return path;
     }
     format!("…{}", characters[characters.len() - 71..].iter().collect::<String>())
+}
+
+/// Platform spelling for shortcut hints shared by tooltips and placeholders.
+pub fn shortcut(text: &str) -> String {
+    if cfg!(target_os = "macos") {
+        text.to_string()
+    } else {
+        text.replace('⇧', "Shift+").replace('⌥', "Alt+").replace('⌘', "Ctrl+")
+    }
+}
+
+pub fn key_binding(macos: &'static str, other: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") { macos } else { other }
 }
 
 /// Writes `text` to the clipboard.

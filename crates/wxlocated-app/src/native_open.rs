@@ -77,10 +77,16 @@ mod tests {
 
     #[test]
     fn native_file_urls_preserve_paths() {
-        assert_eq!(file_path("file:///tmp/a%20b/x.wxapkg").unwrap().to_str(), Some("/tmp/a b/x.wxapkg"));
-        assert_eq!(file_path("file://localhost/%E5%8C%85/overlay.json").unwrap().to_str(), Some("/包/overlay.json"));
-        assert_eq!(file_path("file:///tmp/a%23b").unwrap().to_str(), Some("/tmp/a#b"));
+        let root = std::env::temp_dir().join("WxLocated URL 测试");
+        for relative in ["a b/x.wxapkg", "包/overlay.json", "a#b", "a%20b"] {
+            let path = root.join(relative);
+            let url = url::Url::from_file_path(&path).unwrap();
+            assert_eq!(file_path(url.as_str()).unwrap(), path);
+        }
         assert!(file_path("https://example.com/x").is_err());
+        #[cfg(not(windows))]
         assert!(file_path("file://remote-host/tmp/x.wxapkg").is_err());
+        #[cfg(windows)]
+        assert_eq!(file_path("file://server/share/x.wxapkg").unwrap(), std::path::PathBuf::from(r"\\server\share\x.wxapkg"));
     }
 }

@@ -119,7 +119,9 @@ pub fn matching_layers(app_id: &str, version: Option<&str>, hashes: &std::collec
 /// Letters, digits, `-`, `_` and `.`; anything else becomes `_`.
 pub fn safe_name(value: &str) -> String {
     let cleaned: String = value.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
-    if cleaned.is_empty() || cleaned.starts_with('.') { "agent".into() } else { cleaned }
+    if cleaned.is_empty() || cleaned.starts_with('.') { "agent".into() }
+    else if cfg!(windows) { crate::platform::safe_file_name(&cleaned) }
+    else { cleaned }
 }
 
 // MARK: Writing

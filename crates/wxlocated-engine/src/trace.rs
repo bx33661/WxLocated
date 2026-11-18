@@ -55,7 +55,7 @@ pub fn trace(args: &[String], root: impl Fn(&str) -> PathBuf) -> Result<Value, T
 
     // Agent semantic layers resolve to the static rebuild file they replace;
     // the agent's line text is then anchored in that file's raw range.
-    let mut path = requested_path.clone();
+    let mut path = requested_path.replace('\\', "/");
     let mut overlay_info: Option<Value> = None;
     let mut needle_path: Option<PathBuf> = None;
     if path.starts_with("semantic/") {
@@ -410,7 +410,8 @@ fn split_line(value: &str) -> (String, Option<i64>) {
 
 /// Letters, digits, `-`, `_`, `.`; anything else `_` (no fallback name).
 fn trace_safe_name(value: &str) -> String {
-    value.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect()
+    let cleaned: String = value.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
+    if cfg!(windows) && !cleaned.is_empty() { crate::platform::safe_file_name(&cleaned) } else { cleaned }
 }
 
 #[cfg(test)]

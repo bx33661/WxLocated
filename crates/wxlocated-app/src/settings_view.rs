@@ -84,7 +84,7 @@ pub fn open_settings(tab: Option<Tab>, cx: &mut App) {
     }
 }
 
-#[cfg(feature = "snapshot")]
+#[cfg(all(feature = "snapshot", target_os = "macos"))]
 pub fn snapshot_tab(handle: AnyWindowHandle, tab: Tab, cx: &mut App) {
     if let Some(root) = handle.downcast::<gpui_kit::base::Root>() {
         root.update(cx, |root, _, cx| {
@@ -99,7 +99,7 @@ pub fn snapshot_tab(handle: AnyWindowHandle, tab: Tab, cx: &mut App) {
     }
 }
 
-#[cfg(feature = "snapshot")]
+#[cfg(all(feature = "snapshot", target_os = "macos"))]
 pub fn window(cx: &App) -> Option<AnyWindowHandle> {
     cx.try_global::<SettingsWindow>().map(|w| w.0)
 }
@@ -139,7 +139,7 @@ pub fn cli_binary() -> Option<PathBuf> {
 }
 
 fn shim_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/bin/wxlocated")
+    wxlocated_engine::platform::cli_install_path().unwrap_or_default()
 }
 
 #[derive(PartialEq)]
@@ -152,7 +152,8 @@ enum CliStatus {
 fn cli_status() -> CliStatus {
     match (std::fs::read_to_string(shim_path()), cli_binary()) {
         (Err(_), _) => CliStatus::NotInstalled,
-        (Ok(contents), Some(binary)) if contents.contains(&*binary.to_string_lossy()) => CliStatus::Installed,
+        (Ok(contents), Some(binary)) if wxlocated_engine::platform::cli_wrapper(&binary).is_ok_and(|expected| contents == expected)
+            || !cfg!(windows) && contents.contains(&*binary.to_string_lossy()) => CliStatus::Installed,
         _ => CliStatus::Elsewhere,
     }
 }
@@ -160,9 +161,12 @@ fn cli_status() -> CliStatus {
 /// A shim in ~/.local/bin forwarding to the bundled CLI; no admin rights.
 fn install_cli() -> std::io::Result<()> {
     let binary = cli_binary().ok_or_else(|| std::io::Error::other("找不到随 App 附带的 wxlocated"))?;
-    let shim = shim_path();
+    let shim = wxlocated_engine::platform::cli_install_path()
+        .ok_or_else(|| std::io::Error::other("无法确定当前用户的命令行安装目录"))?;
     std::fs::create_dir_all(shim.parent().unwrap_or(&shim))?;
-    std::fs::write(&shim, format!("#!/bin/sh\n# Installed by WxLocated. Forwards to the bundled CLI.\nexec \"{}\" \"$@\"\n", binary.display()))?;
+    std::fs::write(&shim, wxlocated_engine::platform::cli_wrapper(&binary)?)?;
+    #[cfg(windows)]
+    wxlocated_engine::platform::add_cli_to_user_path(shim.parent().unwrap())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -211,7 +215,13 @@ impl SettingsView {
         self.checking = true;
         cx.notify();
         let task = cx.background_executor().spawn(async move {
-            let output = std::process::Command::new(binary).arg("doctor").output().map_err(|e| e.to_string())?;
+            let mut command = std::process::Command::new(binary);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            let output = command.arg("doctor").output().map_err(|e| e.to_string())?;
             serde_json::from_slice::<Value>(&output.stdout).map_err(|e| e.to_string())
         });
         cx.spawn(async move |this, cx| {
@@ -511,7 +521,7 @@ impl SettingsView {
         let mut cli_rows = vec![
             row(
                 "wxlocated",
-                Some("安装到 ~/.local/bin，无需管理员权限。业务命令输出 JSON，帮助使用 wxlocated --help；字段约定见项目 README。"),
+                Some(if cfg!(windows) { "安装到当前用户的本地应用目录并加入用户 PATH，无需管理员权限。安装后重新打开终端。业务命令输出 JSON。" } else { "安装到 ~/.local/bin，无需管理员权限。业务命令输出 JSON，帮助使用 wxlocated --help；字段约定见项目 README。" }),
                 h_flex()
                     .gap_2()
                     .child(status_badge)
@@ -535,7 +545,7 @@ impl SettingsView {
                     .into_any_element(),
                 &palette,
             ),
-            row("位置", None, div().text_size(px(11.5)).font_family(ui::mono_font()).text_color(palette.secondary).child("~/.local/bin/wxlocated").into_any_element(), &palette),
+            row("位置", None, div().text_size(px(11.5)).font_family(ui::mono_font()).text_color(palette.secondary).child(display_path(&shim_path().to_string_lossy())).into_any_element(), &palette),
         ];
         if let Some(error) = &self.cli_error {
             cli_rows.push(div().px(px(14.)).py_2().text_size(px(12.)).text_color(palette.error).child(error.clone()).into_any_element());
@@ -688,7 +698,7 @@ impl SettingsView {
                 vec![
                     row("导出", None, text("只写入你选择或 --out 指定的目录"), &palette),
                     row("Agent 重建层", None, mono(display_path(&overlays.to_string_lossy())), &palette),
-                    row("命令行工具", None, mono("~/.local/bin/wxlocated（仅在你点击安装时）".into()), &palette),
+                    row("命令行工具", None, mono(format!("{}（仅在你点击安装时）", display_path(&shim_path().to_string_lossy()))), &palette),
                     row(
                         "偏好设置",
                         None,
@@ -700,7 +710,7 @@ impl SettingsView {
             ),
             h_flex()
                 .gap_2()
-                .child(Button::new("reveal-overlays").icon(IconName::FolderOpen).label("在 Finder 中显示重建层目录").small().on_click(move |_, _, cx| {
+                .child(Button::new("reveal-overlays").icon(IconName::FolderOpen).label(format!("在 {} 中显示重建层目录", wxlocated_engine::platform::file_manager_name())).small().on_click(move |_, _, cx| {
                     let _ = std::fs::create_dir_all(&overlays);
                     cx.reveal_path(&overlays)
                 }))

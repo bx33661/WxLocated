@@ -26,7 +26,7 @@ pub fn done(message: impl Into<SharedString>, reveal: Option<PathBuf>, window: &
     if let Some(path) = reveal {
         note = note.action(move |_, _, _| {
             let path = path.clone();
-            Button::new("reveal").label("在 Finder 中显示").ghost().on_click(move |_, _, cx| cx.reveal_path(&path))
+            Button::new("reveal").label(format!("在 {} 中显示", wxlocated_engine::platform::file_manager_name())).ghost().on_click(move |_, _, cx| cx.reveal_path(&path))
         });
     }
     window.push_notification(note, cx);
@@ -195,12 +195,12 @@ pub fn into_folder<V: 'static>(
 /// The main `.wxapkg`, copied byte for byte.
 pub fn export_main_package<V: 'static>(app: &Miniapp, window: &mut Window, cx: &mut Context<V>) {
     let source = app.main_package.clone();
-    let name: String = app.display_name().chars().map(|c| if "/\\:".contains(c) { '_' } else { c }).collect();
+    let name = wxlocated_engine::platform::safe_file_name(app.display_name());
     save_bytes(format!("{name}.wxapkg"), move || std::fs::read(&source).map_err(|e| e.to_string()), window, cx);
 }
 
 fn downloads() -> PathBuf {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")).filter(|p| p.is_dir()).unwrap_or_else(|| PathBuf::from("/"))
+    wxlocated_engine::platform::downloads_dir()
 }
 
 fn file_name(path: &Path) -> String {

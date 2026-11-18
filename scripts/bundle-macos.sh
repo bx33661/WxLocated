@@ -22,6 +22,7 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
 binaries=()
 for arch in $ARCHS; do
   target="$arch-apple-darwin"
+  rustup target add "$target"
   cargo build --release --manifest-path "$ROOT/Cargo.toml" --target "$target" -p wxlocated-cli
   cargo build --release --manifest-path "$ROOT/Cargo.toml" --target "$target" -p wxlocated-app
   binaries+=("$ROOT/target/$target/release")
