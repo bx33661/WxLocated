@@ -1,6 +1,6 @@
 # Windows 适配清单
 
-目标：Windows 10/11 x64 下支持缓存发现、解包重建、CLI、桌面操作和便携发布，同时保留 macOS 支持。
+目标：Windows 10/11 x64 和 Windows 11 ARM64 下支持缓存发现、解包重建、CLI、桌面操作和便携发布，同时保留 macOS 支持。
 
 ## 已实现
 
@@ -45,7 +45,7 @@
 - [ ] 点击设置页验证 CLI 安装/卸载及新终端 PATH 生效；本轮未修改用户的持久 PATH。
 - [ ] 在真实发布目录验证可选开始菜单和文件关联的安装/卸载；本轮未注册用户文件关联。
 - [ ] 在只有 VC++ 运行库、未安装开发工具的 Windows 10/11 机器上验证便携 ZIP。
-- [ ] 运行 macOS CI / 实机回归；本轮环境仅验证 Windows。
+- [ ] 确认更新后的 Windows ZIP 验证和 `macos-15` 回归在 GitHub Actions 上通过。本地 macOS 已通过全特性测试，并用合成包检查重建源码、原始视图和概要页；Windows 引擎已通过交叉类型检查。
 
 ## 使用入口
 
@@ -55,4 +55,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bundle-windows.ps1
 python scripts/smoke-cli.py --cli target/x86_64-pc-windows-msvc/release/wxlocated.exe
 ```
 
-发布包：`target/bundle/windows/WxLocated-1.0.0-windows-x64.zip`。
+发布包位于 `target/bundle/windows/`，按 x64 和 ARM64 区分。ARM64 打包使用 `-Target aarch64-pc-windows-msvc`。

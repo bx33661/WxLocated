@@ -2,8 +2,6 @@
 //! the `wxlocated` command and export defaults for agents, what is written
 //! where, and about.
 
-use std::path::PathBuf;
-
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -14,10 +12,15 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_kit::Anchor;
 use serde_json::Value;
+use wxlocated_engine::platform::{self, CliStatus};
 
 use crate::library::Library;
 use crate::theme::{Palette, palette};
 use crate::ui::{self, badge, display_path, mascot};
+
+mod cli;
+
+pub use cli::cli_binary;
 
 pub const AGENT_SNIPPET: &str = "## 小程序审计材料（WxLocated）
 - `wxlocated list` 列出本机缓存的小程序（JSON）
@@ -122,57 +125,6 @@ pub fn add_folder(cx: &mut App) {
         });
     })
     .detach();
-}
-
-/// The `wxlocated` CLI shipped with the app: `Contents/Helpers/wxlocated` in
-/// the macOS bundle (`Contents/MacOS` already holds `WxLocated`, the same name
-/// on a case-insensitive volume), next to the executable elsewhere and in dev.
-pub fn cli_binary() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let directory = executable.parent()?;
-    let name = if cfg!(windows) { "wxlocated.exe" } else { "wxlocated" };
-    let own = std::fs::canonicalize(&executable).ok();
-    [directory.join("../Helpers").join(name), directory.join(name)]
-        .into_iter()
-        .find(|candidate| candidate.is_file() && std::fs::canonicalize(candidate).ok() != own)
-        .map(|candidate| std::fs::canonicalize(&candidate).unwrap_or(candidate))
-}
-
-fn shim_path() -> PathBuf {
-    wxlocated_engine::platform::cli_install_path().unwrap_or_default()
-}
-
-#[derive(PartialEq)]
-enum CliStatus {
-    NotInstalled,
-    Installed,
-    Elsewhere,
-}
-
-fn cli_status() -> CliStatus {
-    match (std::fs::read_to_string(shim_path()), cli_binary()) {
-        (Err(_), _) => CliStatus::NotInstalled,
-        (Ok(contents), Some(binary)) if wxlocated_engine::platform::cli_wrapper(&binary).is_ok_and(|expected| contents == expected)
-            || !cfg!(windows) && contents.contains(&*binary.to_string_lossy()) => CliStatus::Installed,
-        _ => CliStatus::Elsewhere,
-    }
-}
-
-/// A shim in ~/.local/bin forwarding to the bundled CLI; no admin rights.
-fn install_cli() -> std::io::Result<()> {
-    let binary = cli_binary().ok_or_else(|| std::io::Error::other("找不到随 App 附带的 wxlocated"))?;
-    let shim = wxlocated_engine::platform::cli_install_path()
-        .ok_or_else(|| std::io::Error::other("无法确定当前用户的命令行安装目录"))?;
-    std::fs::create_dir_all(shim.parent().unwrap_or(&shim))?;
-    std::fs::write(&shim, wxlocated_engine::platform::cli_wrapper(&binary)?)?;
-    #[cfg(windows)]
-    wxlocated_engine::platform::add_cli_to_user_path(shim.parent().unwrap())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(())
 }
 
 impl SettingsView {
@@ -509,14 +461,20 @@ impl SettingsView {
 
     fn render_agent(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let palette = palette(cx);
-        let status = cli_status();
         let binary = cli_binary();
+        let (path_label, status) = match cli::shim_path() {
+            Ok(path) => (display_path(&path.to_string_lossy()), platform::cli_status(&path, binary.as_deref())),
+            Err(error) => ("未确定".into(), Err(error)),
+        };
+        let cli_status = status.as_ref().ok().copied();
+        let installed = cli_status == Some(CliStatus::Installed);
         let settings = self.library.read(cx).settings.clone();
         let snippet_copied = self.copied == Some("snippet");
-        let status_badge = match status {
-            CliStatus::Installed => badge("已安装", palette.success),
-            CliStatus::Elsewhere => badge("指向其他位置", palette.warning),
-            CliStatus::NotInstalled => badge("未安装", palette.secondary),
+        let status_badge = match cli_status {
+            Some(CliStatus::Installed) => badge("已安装", palette.success),
+            Some(CliStatus::Elsewhere) => badge("指向其他位置", palette.warning),
+            Some(CliStatus::NotInstalled) => badge("未安装", palette.secondary),
+            None => badge("状态未知", palette.warning),
         };
         let mut cli_rows = vec![
             row(
@@ -527,28 +485,33 @@ impl SettingsView {
                     .child(status_badge)
                     .child(
                         Button::new("install-cli")
-                            .label(if status == CliStatus::Installed { "重新安装" } else { "安装" })
+                            .label(if installed { "重新安装" } else { "安装" })
                             .small()
-                            .when(status != CliStatus::Installed, |b| b.primary())
-                            .disabled(binary.is_none())
+                            .when(!installed, |b| b.primary())
+                            .disabled(binary.is_none() || !matches!(cli_status, Some(CliStatus::Installed | CliStatus::NotInstalled)))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.cli_error = install_cli().err().map(|e| format!("安装失败：{e}"));
+                                this.cli_error = cli::install().err().map(|e| format!("安装失败：{e}"));
                                 cx.notify();
                             })),
                     )
-                    .when(status != CliStatus::NotInstalled, |this| {
-                        this.child(Button::new("uninstall-cli").label("卸载").small().ghost().on_click(cx.listener(|_, _, _, cx| {
-                            let _ = std::fs::remove_file(shim_path());
+                    .when(installed, |this| {
+                        this.child(Button::new("uninstall-cli").label("卸载").small().ghost().on_click(cx.listener(|this, _, _, cx| {
+                            this.cli_error = cli::uninstall().err().map(|e| format!("卸载失败：{e}"));
                             cx.notify();
                         })))
                     })
                     .into_any_element(),
                 &palette,
             ),
-            row("位置", None, div().text_size(px(11.5)).font_family(ui::mono_font()).text_color(palette.secondary).child(display_path(&shim_path().to_string_lossy())).into_any_element(), &palette),
+            row("位置", None, div().text_size(px(11.5)).font_family(ui::mono_font()).text_color(palette.secondary).child(path_label).into_any_element(), &palette),
         ];
         if let Some(error) = &self.cli_error {
             cli_rows.push(div().px(px(14.)).py_2().text_size(px(12.)).text_color(palette.error).child(error.clone()).into_any_element());
+        }
+        if let Err(error) = status {
+            cli_rows.push(div().px(px(14.)).py_2().text_size(px(12.)).text_color(palette.error).child(format!("无法检查安装状态：{error}")).into_any_element());
+        } else if cli_status == Some(CliStatus::Elsewhere) {
+            cli_rows.push(div().px(px(14.)).py_2().text_size(px(12.)).text_color(palette.warning).child("安装位置已有其他文件，无法安全覆盖或删除。").into_any_element());
         }
         if binary.is_none() {
             cli_rows.push(
@@ -698,7 +661,7 @@ impl SettingsView {
                 vec![
                     row("导出", None, text("只写入你选择或 --out 指定的目录"), &palette),
                     row("Agent 重建层", None, mono(display_path(&overlays.to_string_lossy())), &palette),
-                    row("命令行工具", None, mono(format!("{}（仅在你点击安装时）", display_path(&shim_path().to_string_lossy()))), &palette),
+                    row("命令行工具", None, mono(cli::shim_path().map(|path| format!("{}（仅在你点击安装时）", display_path(&path.to_string_lossy()))).unwrap_or_else(|_| "安装位置未确定".into())), &palette),
                     row(
                         "偏好设置",
                         None,

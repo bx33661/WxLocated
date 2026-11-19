@@ -13,7 +13,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-14]
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+          - os: macos-15
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -23,18 +30,49 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features --locked
       - run: cargo test --workspace --locked
-      - name: Build Windows release package
+      - name: Build and verify Windows release package
+        id: windows-bundle
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/bundle-windows.ps1
-      - name: Verify the Windows release CLI
-        if: runner.os == 'Windows'
-        run: python scripts/smoke-cli.py --cli target/x86_64-pc-windows-msvc/release/wxlocated.exe
+        env:
+          WINDOWS_TARGET: ${{ matrix.target }}
+          WINDOWS_ARCH: ${{ matrix.arch }}
+        run: |
+          $archive = ./scripts/bundle-windows.ps1 -Target $env:WINDOWS_TARGET
+          $checksum = "$archive.sha256"
+          $zipName = [IO.Path]::GetFileName($archive)
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ((Get-Content -LiteralPath $checksum -Raw).TrimEnd() -cne "$hash  $zipName") {
+            throw "SHA-256 verification failed for $zipName."
+          }
+
+          $extractDir = Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString())
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractDir
+          $packageDir = Join-Path $extractDir ([IO.Path]::GetFileNameWithoutExtension($zipName))
+          foreach ($file in 'wxlocated-app.exe', 'wxlocated.exe', 'install-windows.ps1') {
+            if (-not (Test-Path -LiteralPath (Join-Path $packageDir $file) -PathType Leaf)) {
+              throw "Missing $file in the expected package directory in $zipName."
+            }
+          }
+          $machine = if ($env:WINDOWS_ARCH -eq 'arm64') { 0xAA64 } else { 0x8664 }
+          foreach ($file in 'wxlocated-app.exe', 'wxlocated.exe') {
+            $bytes = [IO.File]::ReadAllBytes((Join-Path $packageDir $file))
+            $header = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ([BitConverter]::ToUInt32($bytes, $header) -ne 0x4550 -or
+                [BitConverter]::ToUInt16($bytes, $header + 4) -ne $machine) {
+              throw "$file is not a Windows $env:WINDOWS_ARCH executable."
+            }
+          }
+          python scripts/smoke-cli.py --cli (Join-Path $packageDir 'wxlocated.exe')
+          if ($LASTEXITCODE -ne 0) { throw "Packaged CLI smoke test failed ($LASTEXITCODE)." }
+
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+          "checksum=$checksum" >> $env:GITHUB_OUTPUT
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:
-          name: WxLocated-windows-x64
+          name: WxLocated-windows-${{ matrix.arch }}
           path: |
-            target/bundle/windows/*.zip
-            target/bundle/windows/*.sha256
+            ${{ steps.windows-bundle.outputs.archive }}
+            ${{ steps.windows-bundle.outputs.checksum }}
           if-no-files-found: error

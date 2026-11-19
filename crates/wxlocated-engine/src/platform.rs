@@ -2,6 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
+mod cli;
+
+pub use cli::{CliStatus, cli_install_path, cli_status, cli_wrapper, cli_wrapper_matches, install_cli, uninstall_cli};
+
 pub fn home_dir() -> Option<PathBuf> {
     directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
 }
@@ -45,55 +49,6 @@ pub fn expand_path(value: &str) -> PathBuf {
     PathBuf::from(expanded)
 }
 
-pub fn cli_install_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().join("WxLocated/bin/wxlocated.cmd"))
-    }
-    #[cfg(not(windows))]
-    {
-        home_dir().map(|home| home.join(".local/bin/wxlocated"))
-    }
-}
-
-/// The shell wrapper installed by the desktop app. Keep filesystem paths
-/// canonical internally, but convert Windows verbatim prefixes for cmd.exe.
-pub fn cli_wrapper(binary: &Path) -> std::io::Result<String> {
-    #[cfg(windows)]
-    {
-        let text = binary
-            .to_str()
-            .ok_or_else(|| std::io::Error::other("命令行程序路径不是有效 Unicode"))?;
-        let target = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{unc}")
-        } else {
-            text.strip_prefix(r"\\?\").unwrap_or(text).to_string()
-        };
-        if target.encode_utf16().count() >= 260
-            || !Path::new(&target).is_absolute()
-            || !Path::new(&target).components().all(|component| match component {
-                std::path::Component::Normal(name) => name.to_str().is_some_and(windows_safe_component),
-                _ => true,
-            })
-        {
-            return Err(std::io::Error::other(
-                "安装目录无法被 Windows 命令行访问，请将 WxLocated 移动到较短的普通路径后重新安装命令行工具",
-            ));
-        }
-        let target = target.replace('%', "%%");
-        Ok(format!(
-            "@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\n\"{target}\" %*\r\nexit /b %errorlevel%\r\n"
-        ))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(format!(
-            "#!/bin/sh\n# Installed by WxLocated. Forwards to the bundled CLI.\nexec '{}' \"$@\"\n",
-            binary.to_string_lossy().replace('\'', "'\\''")
-        ))
-    }
-}
-
 pub fn directory_on_path(directory: &Path) -> bool {
     std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|entry| paths_equal(&entry, directory)))
 }
@@ -106,48 +61,6 @@ pub fn paths_equal(left: &Path, right: &Path) -> bool {
     } else {
         left == right
     }
-}
-
-/// Adds the wrapper directory to the current user's PATH; existing entries
-/// (including expandable variables) are preserved. Existing terminals keep
-/// their inherited environment and must be reopened.
-#[cfg(windows)]
-pub fn add_cli_to_user_path(directory: &Path) -> std::io::Result<()> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
-    use winreg::{RegKey, RegValue, enums::*};
-    let (environment, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey("Environment")?;
-    let existing = match environment.get_value::<String, _>("Path") {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error),
-    };
-    if !std::env::split_paths(&existing).any(|entry| paths_equal(&expand_path(&entry.to_string_lossy()), directory)) {
-        let separator = if existing.is_empty() || existing.ends_with(';') { "" } else { ";" };
-        let updated = format!("{existing}{separator}{}", directory.display());
-        let bytes = updated.encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect();
-        environment.set_raw_value(
-            "Path",
-            &RegValue {
-                bytes,
-                vtype: REG_EXPAND_SZ,
-            },
-        )?;
-        let setting: Vec<u16> = "Environment\0".encode_utf16().collect();
-        // SAFETY: the UTF-16 string stays alive throughout this synchronous
-        // broadcast. No output pointer is supplied; hung windows time out.
-        unsafe {
-            SendMessageTimeoutW(
-                HWND_BROADCAST,
-                WM_SETTINGCHANGE,
-                0,
-                setting.as_ptr() as isize,
-                SMTO_ABORTIFHUNG,
-                1000,
-                std::ptr::null_mut(),
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Whether a single component can be written without Win32 name aliasing.

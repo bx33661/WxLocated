@@ -75,11 +75,8 @@ fn dump_entries(paths: &[String]) -> DumpOutput {
     DumpOutput { packages }
 }
 
-fn emit_failure(failure: &commands::Failure, pretty: bool) -> ExitCode {
-    let mut text = wxlocated_engine::swift_json::encode(&failure.output(), pretty);
-    text.push('\n');
-    print!("{text}");
-    ExitCode::from(failure.exit)
+fn emit(output: &serde_json::Value, pretty: bool) {
+    println!("{}", wxlocated_engine::swift_json::encode(output, pretty));
 }
 
 const USAGE: &str = "wxlocated — 为 Agent 提供本机微信小程序审计材料（输出 JSON）
@@ -112,58 +109,49 @@ fn main() -> ExitCode {
     let pretty = !args.iter().any(|arg| arg == "--compact");
     args.retain(|arg| arg != "--compact");
     let mut scan_paths = Vec::new();
-    while let Some(index) = args.iter().position(|arg| arg == "--scan-path") {
-        if index + 1 >= args.len() || args[index + 1].starts_with('-') {
-            return emit_failure(&commands::Failure {
-                exit: 64, code: "missing_scan_path", message: "--scan-path 需要缓存目录".into(), hint: None,
-            }, pretty);
+    let mut commands_args = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--scan-path" {
+            let Some(path) = args.next().filter(|path| !path.starts_with('-')) else {
+                let failure = commands::Failure {
+                    exit: commands::EXIT_USAGE, code: "missing_scan_path", message: "--scan-path 需要缓存目录".into(), hint: None,
+                };
+                emit(&failure.output(), pretty);
+                return ExitCode::from(failure.exit);
+            };
+            scan_paths.push(path);
+        } else {
+            commands_args.push(arg);
         }
-        scan_paths.push(args.remove(index + 1));
-        args.remove(index);
     }
-    let _ = commands::SCAN_PATHS.set(scan_paths);
-    let Some(command) = args.first().cloned() else {
+    let Some((command, rest)) = commands_args.split_first() else {
         eprintln!("usage: wxlocated <command>");
-        return ExitCode::from(64);
+        return ExitCode::from(commands::EXIT_USAGE);
     };
-    let rest = &args[1..];
     let output = match command.as_str() {
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        "list" => commands::list(),
-        "export" => match commands::export(rest) {
-            Ok(value) => value,
-            Err(failure) => return emit_failure(&failure, pretty),
-        },
-        "overlay" => match tools::overlay(rest) {
-            Ok(value) => value,
-            Err(failure) => return emit_failure(&failure, pretty),
-        },
-        "watch" => match tools::watch(rest) {
+        "list" => Ok(commands::list(&scan_paths)),
+        "export" => commands::export(rest, &scan_paths),
+        "overlay" => tools::overlay(rest, &scan_paths),
+        "watch" => match tools::watch(rest, &scan_paths) {
             Ok(code) => return ExitCode::from(code),
-            Err(failure) => return emit_failure(&failure, pretty),
+            Err(failure) => Err(failure),
         },
         "doctor" => {
-            let (report, code) = tools::doctor();
-            let mut text = wxlocated_engine::swift_json::encode(&report, pretty);
-            text.push('\n');
-            print!("{text}");
+            let (report, code) = tools::doctor(&scan_paths);
+            emit(&report, pretty);
             return ExitCode::from(code);
         }
-        "trace" => match commands::trace(rest) {
-            Ok(value) => value,
-            Err(failure) => return emit_failure(&failure, pretty),
-        },
-        "info" => match commands::info(rest) {
-            Ok(value) => value,
-            Err(failure) => return emit_failure(&failure, pretty),
-        },
-        "version" | "--version" => commands::version(),
-        "__dump-entries" => serde_json::to_value(dump_entries(rest)).expect("serializable output"),
+        "trace" => commands::trace(rest),
+        "info" => commands::info(rest, &scan_paths),
+        "version" | "--version" => Ok(commands::version()),
+        "__dump-entries" => Ok(serde_json::to_value(dump_entries(rest)).expect("serializable output")),
         "__dump-decompilation" => match dump::dump_decompilation(rest) {
-            Ok(value) => value,
+            Ok(value) => Ok(value),
             Err(message) => {
                 eprintln!("{message}");
                 return ExitCode::from(70);
@@ -174,8 +162,14 @@ fn main() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    let mut text = wxlocated_engine::swift_json::encode(&output, pretty);
-    text.push('\n');
-    print!("{text}");
-    ExitCode::SUCCESS
+    match output {
+        Ok(value) => {
+            emit(&value, pretty);
+            ExitCode::SUCCESS
+        }
+        Err(failure) => {
+            emit(&failure.output(), pretty);
+            ExitCode::from(failure.exit)
+        }
+    }
 }

@@ -3,7 +3,7 @@
 # and a disk image, with SHA-256 sums. Signs and notarizes when the
 # identities are given; otherwise the app is signed ad hoc.
 #
-#   VERSION=1.0.0 scripts/build-release.sh
+#   VERSION=1.1.0 scripts/build-release.sh
 #   DEVELOPER_ID_APPLICATION="Developer ID Application: …" \
 #   DEVELOPER_ID_INSTALLER="Developer ID Installer: …" \
 #   NOTARY_KEYCHAIN_PROFILE=wxlocated scripts/build-release.sh
@@ -16,9 +16,9 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_ROOT="${OUTPUT_DIR:-$ROOT/dist/WxLocated-$VERSION-$STAMP}"
 STAGE="$OUTPUT_ROOT/stage"
 APP="$STAGE/WxLocated.app"
-DMG="$OUTPUT_ROOT/WxLocated-$VERSION.dmg"
-PKG="$OUTPUT_ROOT/WxLocated-$VERSION.pkg"
-APP_ARCHIVE="$OUTPUT_ROOT/WxLocated-$VERSION-macOS.zip"
+DMG="$OUTPUT_ROOT/WxLocated-$VERSION-macos-universal.dmg"
+PKG="$OUTPUT_ROOT/WxLocated-$VERSION-macos-universal.pkg"
+APP_ARCHIVE="$OUTPUT_ROOT/WxLocated-$VERSION-macos-universal.zip"
 
 if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
   echo "Requested version $VERSION does not match the workspace version $CARGO_VERSION (Cargo.toml)" >&2
@@ -28,12 +28,16 @@ fi
 mkdir -p "$STAGE"
 OUTPUT_DIR="$STAGE" SIGN_IDENTITY="${DEVELOPER_ID_APPLICATION:--}" "$ROOT/scripts/bundle-macos.sh"
 
-# Smoke test: the bundled CLI runs and reports this version.
-"$APP/Contents/Helpers/wxlocated" --version | grep -q "\"$VERSION\"" || {
-  echo "Bundled CLI does not report version $VERSION" >&2
-  exit 3
-}
-lipo -archs "$APP/Contents/MacOS/WxLocated"
+for executable in "$APP/Contents/MacOS/WxLocated" "$APP/Contents/Helpers/wxlocated"; do
+  lipo -verify_arch arm64 x86_64 "$executable"
+done
+for arch in arm64 x86_64; do
+  output="$(/usr/bin/arch -"$arch" "$APP/Contents/Helpers/wxlocated" --version)"
+  grep -Fq "\"$VERSION\"" <<< "$output" || {
+    echo "Bundled $arch CLI does not report version $VERSION" >&2
+    exit 3
+  }
+done
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$APP_ARCHIVE"

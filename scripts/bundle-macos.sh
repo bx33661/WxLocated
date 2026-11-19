@@ -22,9 +22,12 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
 binaries=()
 for arch in $ARCHS; do
   target="$arch-apple-darwin"
-  rustup target add "$target"
-  cargo build --release --manifest-path "$ROOT/Cargo.toml" --target "$target" -p wxlocated-cli
-  cargo build --release --manifest-path "$ROOT/Cargo.toml" --target "$target" -p wxlocated-app
+  (
+    cd "$ROOT"
+    rustup target add "$target"
+    cargo build --release --locked --target "$target" -p wxlocated-cli
+    cargo build --release --locked --target "$target" -p wxlocated-app
+  )
   binaries+=("$ROOT/target/$target/release")
 done
 
@@ -33,9 +36,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 lipo -create -output "$APP/Contents/MacOS/WxLocated" "${^binaries[@]}/wxlocated-app"
 lipo -create -output "$APP/Contents/Helpers/wxlocated" "${^binaries[@]}/wxlocated"
 
-ICONSET="$(mktemp -d)/AppIcon.iconset"
-cp -R "$ICONS" "$ICONSET"
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+iconutil -c icns "$ICONS" -o "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

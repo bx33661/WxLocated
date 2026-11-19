@@ -11,15 +11,10 @@ use wxlocated_engine::overlay::{self, Author, OverlayError};
 use wxlocated_engine::scan::Miniapp;
 use wxlocated_engine::swift_json::{encode, iso8601};
 
-use crate::commands::{EXIT_FAILURE, EXIT_NOT_FOUND, EXIT_USAGE, Failure, SCHEMA_VERSION, TOOL_VERSION, expand_tilde, scan_cache};
-
-/// `URL(fileURLWithPath:isDirectory:).path`: absolute, no trailing slash.
-fn absolute(path: &str) -> std::path::PathBuf {
-    let joined = std::env::current_dir().unwrap_or_default().join(expand_tilde(path));
-    let text = joined.to_string_lossy().into_owned();
-    let trimmed = text.trim_end_matches('/');
-    std::path::PathBuf::from(if trimmed.is_empty() { "/" } else { trimmed })
-}
+use crate::commands::{
+    EXIT_FAILURE, EXIT_NOT_FOUND, EXIT_USAGE, Failure, SCHEMA_VERSION, TOOL_VERSION,
+    absolute_path, app_query, option_value, positionals, resolve_app, scan_cache,
+};
 
 fn overlay_failure(error: OverlayError) -> Failure {
     Failure { exit: error.exit(), code: error.code(), message: error.to_string(), hint: None }
@@ -36,7 +31,7 @@ fn package_hashes(app: &Miniapp) -> HashMap<String, String> {
     hashes
 }
 
-pub fn overlay(args: &[String]) -> Result<Value, Failure> {
+pub fn overlay(args: &[String], scan_paths: &[String]) -> Result<Value, Failure> {
     let usage = || Failure {
         exit: EXIT_USAGE,
         code: "missing_arguments",
@@ -45,30 +40,15 @@ pub fn overlay(args: &[String]) -> Result<Value, Failure> {
     };
     let Some(sub) = args.first() else { return Err(usage()) };
     let rest = &args[1..];
-    let value = |flag: &str| rest.iter().position(|a| a == flag).and_then(|i| rest.get(i + 1)).cloned();
-    let mut positionals = Vec::new();
-    let mut skip = false;
-    for arg in rest {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if matches!(arg.as_str(), "--name" | "--agent" | "--model") {
-            skip = true;
-            continue;
-        }
-        if !arg.starts_with('-') {
-            positionals.push(arg.clone());
-        }
-    }
+    const VALUED_FLAGS: &[&str] = &["--name", "--agent", "--model"];
+    let value = |flag: &str| option_value(rest, &[flag]);
+    let mut positionals = positionals(rest, VALUED_FLAGS);
     match sub.as_str() {
         "init" => {
-            if positionals.len() < 2 {
-                return Err(usage());
-            }
-            let (material, work) = (absolute(&positionals[0]), absolute(&positionals[1]));
-            let author = Author { agent: value("--agent"), model: value("--model") };
-            let manifest = overlay::initialize(&material, &work, &value("--name").unwrap_or_else(|| "agent".into()), author)
+            let (Some(material), Some(work)) = (positionals.next(), positionals.next()) else { return Err(usage()) };
+            let (material, work) = (absolute_path(material), absolute_path(work));
+            let author = Author { agent: value("--agent").map(str::to_owned), model: value("--model").map(str::to_owned) };
+            let manifest = overlay::initialize(&material, &work, value("--name").unwrap_or("agent"), author)
                 .map_err(overlay_failure)?;
             let work_text = work.to_string_lossy().into_owned();
             let mut output = json!({
@@ -89,16 +69,15 @@ pub fn overlay(args: &[String]) -> Result<Value, Failure> {
             Ok(output)
         }
         "import" => {
-            let Some(path) = positionals.first() else { return Err(usage()) };
-            let work = absolute(path);
+            let work = absolute_path(positionals.next().ok_or_else(usage)?);
             let manifest = overlay::read_manifest_strict(&work).map_err(overlay_failure)?;
-            let snapshot = scan_cache();
+            let snapshot = scan_cache(scan_paths);
             let app = snapshot
                 .miniapps
                 .iter()
                 .find(|app| app.app_id == manifest.base.app_id)
                 .ok_or_else(|| overlay_failure(OverlayError::UnknownApp(manifest.base.app_id.clone())))?;
-            let result = overlay::import(&work, &app.app_id, app.version.as_deref(), &package_hashes(app), value("--name").as_deref())
+            let result = overlay::import(&work, &app.app_id, app.version.as_deref(), &package_hashes(app), value("--name"))
                 .map_err(overlay_failure)?;
             let mut output = json!({
                 "schema_version": overlay::SCHEMA_VERSION,
@@ -115,14 +94,14 @@ pub fn overlay(args: &[String]) -> Result<Value, Failure> {
             Ok(output)
         }
         "list" => {
-            let filter = positionals.first();
+            let filter = positionals.next();
             let root = overlay::root();
             let mut apps: Vec<String> = std::fs::read_dir(&root)
                 .map(|entries| entries.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
                 .unwrap_or_default();
             apps.sort();
             let mut layers = Vec::new();
-            for app_id in apps.iter().filter(|id| filter.is_none_or(|f| f == *id)) {
+            for app_id in apps.iter().filter(|id| filter.is_none_or(|f| f == id.as_str())) {
                 let mut versions: Vec<String> = std::fs::read_dir(root.join(app_id))
                     .map(|entries| entries.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
                     .unwrap_or_default();
@@ -150,14 +129,11 @@ pub fn overlay(args: &[String]) -> Result<Value, Failure> {
             Ok(json!({ "schema_version": overlay::SCHEMA_VERSION, "layers": layers }))
         }
         "remove" => {
-            if positionals.len() < 2 {
-                return Err(usage());
-            }
-            let (app_id, name) = (&positionals[0], &positionals[1]);
+            let (Some(app_id), Some(name)) = (positionals.next(), positionals.next()) else { return Err(usage()) };
             let versions: Vec<String> = std::fs::read_dir(overlay::root().join(app_id))
                 .map(|entries| entries.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
                 .unwrap_or_default();
-            let layer = versions.iter().flat_map(|v| overlay::layers(app_id, Some(v))).find(|layer| layer.manifest.name == *name);
+            let layer = versions.iter().flat_map(|v| overlay::layers(app_id, Some(v))).find(|layer| layer.manifest.name == name);
             let Some(layer) = layer else {
                 return Err(Failure { exit: EXIT_NOT_FOUND, code: "not_found", message: format!("{app_id} 没有名为 {name} 的重建层"), hint: None });
             };
@@ -171,22 +147,10 @@ pub fn overlay(args: &[String]) -> Result<Value, Failure> {
 
 // MARK: watch
 
-fn locate(query: &str) -> Result<(Miniapp, Context), Failure> {
-    let snapshot = scan_cache();
-    let app = snapshot
-        .miniapps
-        .iter()
-        .find(|app| app.app_id == query)
-        .or_else(|| snapshot.miniapps.iter().find(|app| app.name.as_deref() == Some(query)))
-        .cloned()
-        .ok_or_else(|| Failure {
-            exit: EXIT_NOT_FOUND,
-            code: "not_found",
-            message: format!("本机缓存中没有找到 {query}"),
-            hint: Some("先在微信中打开这个小程序，再运行 wxlocated list 确认 AppID".into()),
-        })?;
-    let context = Context::for_app(&snapshot, &app);
-    Ok((app, context))
+fn locate(query: &str, scan_paths: &[String]) -> Result<(Miniapp, Context), Failure> {
+    let snapshot = scan_cache(scan_paths);
+    let app = resolve_app(&snapshot, query)?;
+    Ok((app.clone(), Context::for_app(&snapshot, app)))
 }
 
 /// Plugin declarations come from app.json, so they are read once per version.
@@ -225,16 +189,19 @@ fn with_version(mut value: Value, version: &Option<String>) -> Value {
 /// Waits for missing subpackages and plugins to land in the cache. Emits one
 /// JSON object per line: `started`, `subpackage_found`, `plugin_found`,
 /// `version_changed`, then `complete` (exit 0) or `timeout` (exit 75).
-pub fn watch(args: &[String]) -> Result<u8, Failure> {
-    let query = args
-        .iter()
-        .find(|arg| !arg.starts_with('-') && arg.parse::<f64>().is_err())
-        .ok_or(Failure { exit: EXIT_USAGE, code: "missing_app", message: "watch 需要一个 AppID 或小程序名称".into(), hint: None })?;
-    let number = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok());
-    let timeout = number("--timeout").unwrap_or(600.0);
-    let interval = number("--interval").unwrap_or(2.0).max(0.5);
+pub fn watch(args: &[String], scan_paths: &[String]) -> Result<u8, Failure> {
+    let query = app_query(args, "watch", &["--timeout", "--interval"])?;
+    let duration = |flag, default: f64, minimum: f64| {
+        let seconds = option_value(args, &[flag]).and_then(|value| value.parse::<f64>().ok()).unwrap_or(default);
+        Duration::try_from_secs_f64(if seconds.is_finite() { seconds.max(minimum) } else { seconds })
+            .map_err(|_| Failure {
+                exit: EXIT_USAGE, code: "invalid_duration", message: format!("{flag} 需要有限且可表示的秒数"), hint: None,
+            })
+    };
+    let timeout = duration("--timeout", 600.0, 0.0)?;
+    let interval = duration("--interval", 2.0, 0.5)?;
 
-    let (mut app, context) = locate(query)?;
+    let (mut app, context) = locate(query, scan_paths)?;
     let mut plugins = declared_plugins(&app);
     let mut state = Completeness::new(&app, Some(&plugins), &context);
     let complete = |state: &Completeness| state.missing_subpackages.is_empty() && state.missing_plugins.is_empty();
@@ -257,13 +224,20 @@ pub fn watch(args: &[String]) -> Result<u8, Failure> {
         return Ok(0);
     }
 
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout.max(0.0));
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_secs_f64(interval));
-        let Ok((latest, latest_context)) = locate(&app.app_id) else { continue };
-        if latest.version != app.version {
+    let started_at = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(interval.min(remaining));
+        let Ok((latest, latest_context)) = locate(&app.app_id, scan_paths) else { continue };
+        let version_changed = latest.version != app.version;
+        if version_changed {
             plugins = declared_plugins(&latest);
-            let next = Completeness::new(&latest, Some(&plugins), &latest_context);
+        }
+        let next = Completeness::new(&latest, Some(&plugins), &latest_context);
+        if version_changed {
             let mut event = with_version(
                 json!({
                     "event": "version_changed",
@@ -277,9 +251,7 @@ pub fn watch(args: &[String]) -> Result<u8, Failure> {
                 event["previous_version"] = json!(previous);
             }
             emit(event);
-            state = next;
         } else {
-            let next = Completeness::new(&latest, Some(&plugins), &latest_context);
             for root in state.missing_subpackages.iter().filter(|root| !next.missing_subpackages.contains(root)) {
                 let key = wxlocated_engine::material::cache_key_for_root(root);
                 let file = latest.sub_packages.iter().find(|path| {
@@ -305,8 +277,8 @@ pub fn watch(args: &[String]) -> Result<u8, Failure> {
                 }
                 emit(event);
             }
-            state = next;
         }
+        state = next;
         app = latest;
         if complete(&state) {
             emit(with_version(
@@ -331,10 +303,6 @@ pub fn watch(args: &[String]) -> Result<u8, Failure> {
 
 // MARK: doctor
 
-/// `~/.local/bin/wxlocated`, a shim forwarding to the installed binary.
-pub fn shim_path() -> std::path::PathBuf {
-    wxlocated_engine::platform::cli_install_path().unwrap_or_default()
-}
 
 fn os_version() -> String {
     #[cfg(target_os = "macos")]
@@ -360,8 +328,8 @@ fn os_version() -> String {
 /// Checks what agents most often trip over: disk access, cache locations,
 /// WeChat, and whether the CLI is reachable on PATH. Exit 0 when nothing
 /// fails (warnings allowed), 70 otherwise.
-pub fn doctor() -> (Value, u8) {
-    let snapshot = scan_cache();
+pub fn doctor(scan_paths: &[String]) -> (Value, u8) {
+    let snapshot = scan_cache(scan_paths);
     let mut checks: Vec<Value> = Vec::new();
     let check = |id: &str, status: &str, message: String, fix: Option<String>| {
         let mut value = json!({ "id": id, "status": status, "message": message });
@@ -415,15 +383,15 @@ pub fn doctor() -> (Value, u8) {
         None => checks.push(check("wechat", "warn", "未检测到微信客户端版本，material.json 将不记录客户端版本".into(), None)),
     }
 
-    let executable = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let shim = shim_path();
-    let shim_directory = shim.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let on_path = wxlocated_engine::platform::directory_on_path(std::path::Path::new(&shim_directory));
-    let direct_on_path = std::path::Path::new(&executable).parent().is_some_and(wxlocated_engine::platform::directory_on_path);
-    let expected_shim = wxlocated_engine::platform::cli_wrapper(std::path::Path::new(&executable)).ok();
-    let shim_matches = |contents: &String| expected_shim.as_ref().is_some_and(|expected| expected == contents)
-        || !cfg!(windows) && contents.contains(&executable);
-    match std::fs::read_to_string(&shim) {
+    use wxlocated_engine::platform::{cli_install_path, cli_wrapper_matches, directory_on_path};
+    let executable_path = std::env::current_exe().ok();
+    let executable = executable_path.as_deref().map(|path| path.to_string_lossy()).unwrap_or_default();
+    let shim_path = cli_install_path();
+    let shim = shim_path.as_deref().unwrap_or_else(|| std::path::Path::new(""));
+    let on_path = shim.parent().is_some_and(directory_on_path);
+    let direct_on_path = executable_path.as_deref().and_then(std::path::Path::parent).is_some_and(directory_on_path);
+    let shim_matches = |contents: &str| executable_path.as_ref().is_some_and(|path| cli_wrapper_matches(path, contents));
+    match std::fs::read_to_string(shim) {
         _ if direct_on_path => checks.push(check("cli", "ok", format!("命令行程序所在目录已加入 PATH：{executable}"), None)),
         Ok(contents) if shim_matches(&contents) && on_path => {
             checks.push(check("cli", "ok", format!("wxlocated 已安装在 {}", shim.to_string_lossy()), None));
@@ -444,14 +412,15 @@ pub fn doctor() -> (Value, u8) {
     }
 
     let failed = checks.iter().any(|c| c["status"] == "fail");
+    let os_version = os_version();
     let report = json!({
         "schema_version": SCHEMA_VERSION,
         "ok": !failed,
         "tool_version": TOOL_VERSION,
         "os": std::env::consts::OS,
-        "os_version": os_version(),
+        "os_version": os_version,
         // Kept for existing macOS consumers; Windows uses os/os_version.
-        "macos_version": if cfg!(target_os = "macos") { Some(os_version()) } else { None },
+        "macos_version": cfg!(target_os = "macos").then_some(os_version),
         "executable": executable,
         "checks": checks,
     });

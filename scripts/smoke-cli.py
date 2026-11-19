@@ -45,17 +45,25 @@ def main():
         environment['WXLOCATED_SMOKE_CACHE'] = str(root / 'WeChat Files')
         scan = ['--scan-path', '%WXLOCATED_SMOKE_CACHE%/*/Applet']
 
-        def run(*arguments):
+        def invoke(*arguments, expected_exit=0):
             process = subprocess.run([str(executable), *map(str, arguments)], env=environment,
                                      capture_output=True, encoding='utf-8', timeout=60)
-            if process.returncode:
-                raise RuntimeError(f'{arguments[0]} failed ({process.returncode}): {process.stdout}\n{process.stderr}')
-            return json.loads(process.stdout)
+            if process.returncode != expected_exit:
+                raise RuntimeError(f'{arguments[0]} exited {process.returncode}, expected {expected_exit}: '
+                                   f'{process.stdout}\n{process.stderr}')
+            return process.stdout
+
+        def run(*arguments):
+            return json.loads(invoke(*arguments))
 
         listing = run('list', *scan)
         assert any(app['app_id'] == app_id for app in listing['miniapps'])
         info = run('info', app_id, *scan)
         assert info['metadata']['app_id'] == app_id
+        events = [json.loads(line) for line in invoke('watch', '--timeout', '0', app_id, *scan).splitlines()]
+        assert [event['event'] for event in events] == ['started', 'complete']
+        invalid = json.loads(invoke('watch', '--interval', 'inf', app_id, *scan, expected_exit=64))
+        assert invalid['error']['code'] == 'invalid_duration'
         exported = run('export', app_id, '--out', root / '导出 output', '--redact', *scan)
         material_root = Path(exported['root'])
         assert (material_root / 'source/app.js').read_bytes() == b'App({});\n'
@@ -71,7 +79,7 @@ def main():
         assert reused['reused'] is True
         run('overlay', 'init', material_root, root / '语义层 work', '--name', 'CON')
         assert (root / '语义层 work/overlay.json').is_file()
-        print('CLI smoke passed: scan, info, export, redact, trace, reuse, overlay init (Unicode paths).')
+        print('CLI smoke passed: scan, info, watch, export, redact, trace, reuse, overlay init (Unicode paths).')
 
 
 if __name__ == '__main__':

@@ -111,12 +111,10 @@ impl Gallery {
         self.search.read(cx).value().trim().to_lowercase()
     }
 
-    fn visible_apps(&self, cx: &App) -> Vec<Miniapp> {
+    fn visible_apps<'a>(&self, apps: &'a [Miniapp], cx: &App) -> Vec<&'a Miniapp> {
         let query = self.query(cx);
         let library = self.library.read(cx);
-        let mut apps: Vec<Miniapp> = library
-            .apps()
-            .iter()
+        let mut apps: Vec<_> = apps.iter()
             .filter(|app| match self.filter {
                 Filter::All => true,
                 Filter::Rebuilt => library.rebuilt.contains_key(&app.app_id),
@@ -128,7 +126,6 @@ impl Gallery {
                     || app.app_id.to_lowercase().contains(&query)
                     || app.main_package.to_string_lossy().to_lowercase().contains(&query)
             })
-            .cloned()
             .collect();
         match library.settings.sort_order.as_str() {
             "name" => apps.sort_by(|a, b| natural_compare(a.display_name(), b.display_name())),
@@ -165,7 +162,9 @@ impl Gallery {
     }
 
     fn move_selection(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let apps = self.visible_apps(cx);
+        let snapshot = self.library.read(cx).snapshot.clone();
+        let all_apps = snapshot.as_deref().map_or(&[][..], |snapshot| snapshot.miniapps.as_slice());
+        let apps = self.visible_apps(all_apps, cx);
         if apps.is_empty() {
             return;
         }
@@ -310,7 +309,7 @@ impl Gallery {
     fn quick_look(&mut self, app: Miniapp, window: &mut Window, cx: &mut Context<Self>) {
         let (icon, ambient) = self.library.update(cx, |library, _| library.icon(&app));
         let summary = self.library.read(cx).rebuilt.get(&app.app_id).copied();
-        let derived = self.library.update(cx, |library, _| library.derived(&app));
+        let derived = self.library.read(cx).derived_ref(&app.app_id);
         let gallery = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
             let palette = palette(cx);
@@ -485,13 +484,13 @@ impl Gallery {
 
     fn render_tile(&self, app: &Miniapp, summary: Option<RebuildSummary>, cx: &mut Context<Self>) -> impl IntoElement {
         let (icon, ambient) = self.library.update(cx, |library, _| library.icon(app));
-        let derived = self.library.update(cx, |library, _| library.derived(app));
+        let derived = self.library.read(cx).derived_ref(&app.app_id);
         let declared = derived.declares || derived.plugins > 0;
         let selected = self.selected.as_deref() == Some(app.app_id.as_str());
         let hovered = self.hovered.as_deref() == Some(app.app_id.as_str());
         let palette = palette(cx);
         let id = app.app_id.clone();
-        let (hover_id, menu_app) = (id.clone(), app.clone());
+        let (hover_id, menu_id) = (id.clone(), id.clone());
         let accessible_id = id.clone();
         let title = match &app.name {
             Some(name) if !name.is_empty() => name.clone(),
@@ -605,10 +604,10 @@ impl Gallery {
                     this.open(&id, cx);
                 }
             }))
-            .context_menu(move |menu, _, _| app_context_menu(menu, &menu_app, gallery.clone()))
+            .context_menu(move |menu, _, _| app_context_menu(menu, &menu_id, gallery.clone()))
     }
 
-    fn render_recent(&self, apps: &[Miniapp], cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_recent(&self, apps: &[&Miniapp], cx: &mut Context<Self>) -> impl IntoElement {
         let palette = palette(cx);
         let cards: Vec<AnyElement> = apps
             .iter()
@@ -869,26 +868,28 @@ fn material_status(derived: Derived) -> String {
     }
 }
 
-/// Right-click menu on a tile.
-type TileAction = Box<dyn Fn(&mut Gallery, Miniapp, &mut Window, &mut Context<Gallery>)>;
-
-fn app_context_menu(menu: PopupMenu, app: &Miniapp, gallery: WeakEntity<Gallery>) -> PopupMenu {
-    let item = |label: &'static str, icon: IconName, action: TileAction| {
-        let (gallery, app) = (gallery.clone(), app.clone());
+/// Right-click actions resolve the current app when invoked, even after a rescan.
+fn app_context_menu(menu: PopupMenu, app_id: &str, gallery: WeakEntity<Gallery>) -> PopupMenu {
+    let item = |label: &'static str, icon: IconName, action: fn(&mut Gallery, Miniapp, &mut Window, &mut Context<Gallery>)| {
+        let (gallery, id) = (gallery.clone(), app_id.to_owned());
         PopupMenuItem::new(label).icon(icon).on_click(move |_, window, cx| {
-            gallery.update(cx, |this, cx| action(this, app.clone(), window, cx)).ok();
+            gallery.update(cx, |this, cx| {
+                if let Some(app) = this.library.read(cx).app(&id).cloned() {
+                    action(this, app, window, cx);
+                }
+            }).ok();
         })
     };
-    menu.item(item("打开", IconName::ArrowUpRight, Box::new(|this, app, _, cx| this.open(&app.app_id, cx))))
-        .item(item("快速查看", IconName::Eye, Box::new(|this, app, window, cx| this.quick_look(app, window, cx))))
+    menu.item(item("打开", IconName::ArrowUpRight, |this, app, _, cx| this.open(&app.app_id, cx)))
+        .item(item("快速查看", IconName::Eye, Gallery::quick_look))
         .separator()
-        .item(item("显示缓存目录", IconName::FolderOpen, Box::new(|_, app, _, cx| cx.reveal_path(&app.cache_directory()))))
-        .item(item("复制路径", IconName::Copy, Box::new(|this, app, _, cx| this.copy_path(&app, cx))))
-        .item(item("复制 AppID", IconName::Hash, Box::new(|_, app, _, cx| ui::copy(app.app_id.clone(), cx))))
-        .item(item("设置显示名称…", IconName::Pencil, Box::new(|this, app, window, cx| this.start_rename(app, window, cx))))
+        .item(item("显示缓存目录", IconName::FolderOpen, |_, app, _, cx| cx.reveal_path(&app.cache_directory())))
+        .item(item("复制路径", IconName::Copy, |this, app, _, cx| this.copy_path(&app, cx)))
+        .item(item("复制 AppID", IconName::Hash, |_, app, _, cx| ui::copy(app.app_id, cx)))
+        .item(item("设置显示名称…", IconName::Pencil, Gallery::start_rename))
         .separator()
-        .item(item("导出审计材料…", IconName::Download, Box::new(|this, app, window, cx| this.export_material(app, window, cx))))
-        .item(item("导出主包…", IconName::Package, Box::new(|_, app, window, cx| crate::export::export_main_package(&app, window, cx))))
+        .item(item("导出审计材料…", IconName::Download, Gallery::export_material))
+        .item(item("导出主包…", IconName::Package, |_, app, window, cx| crate::export::export_main_package(&app, window, cx)))
 }
 
 impl Render for Gallery {
@@ -896,17 +897,21 @@ impl Render for Gallery {
         let palette: Palette = palette(cx);
         let width = f32::from(window.viewport_size().width) - PADDING * 2. + TILE_GAP;
         self.columns = ((width / (TILE_WIDTH + TILE_GAP)).floor() as usize).max(2);
-        let apps = self.visible_apps(cx);
         let library = self.library.read(cx);
-        let total = library.apps().len();
-        let rebuilt_count = library.apps().iter().filter(|a| library.rebuilt.contains_key(&a.app_id)).count();
-        let incomplete_count = library.apps().iter().filter(|a| library.derived_ref(&a.app_id).is_incomplete()).count();
+        let snapshot = library.snapshot.clone();
+        let all_apps = snapshot.as_deref().map_or(&[][..], |snapshot| snapshot.miniapps.as_slice());
+        let apps = self.visible_apps(all_apps, cx);
+        let total = all_apps.len();
+        let (rebuilt_count, incomplete_count) = all_apps.iter().fold((0, 0), |(rebuilt, incomplete), app| {
+            (rebuilt + usize::from(library.rebuilt.contains_key(&app.app_id)), incomplete + usize::from(library.derived_ref(&app.app_id).is_incomplete()))
+        });
         let gap = library.has_coverage_gap();
         let query_empty = self.query(cx).is_empty();
-        let recent: Vec<Miniapp> = if self.filter == Filter::All && query_empty {
-            let mut recent = library.recent_apps();
-            recent.truncate((self.columns / 2).clamp(2, 4));
-            recent
+        let recent: Vec<_> = if self.filter == Filter::All && query_empty {
+            library.settings.recent_app_ids.iter()
+                .filter_map(|id| all_apps.iter().find(|app| &app.app_id == id))
+                .take((self.columns / 2).clamp(2, 4))
+                .collect()
         } else {
             Vec::new()
         };

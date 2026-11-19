@@ -130,7 +130,7 @@ impl Render for QuickOpen {
             .enumerate()
             .map(|(index, app)| {
                 let (icon, ambient) = Library::global(cx).update(cx, |library, _| library.icon(app));
-                let derived = Library::global(cx).update(cx, |library, _| library.derived(app));
+                let derived = Library::global(cx).read(cx).derived_ref(&app.app_id);
                 let material = match (derived.missing, derived.missing_plugins) {
                     (0, 0) => None,
                     (packages, 0) => Some(format!("缺 {packages} 个分包")),

@@ -6,7 +6,7 @@
 
 mod metadata;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -107,6 +107,17 @@ pub struct Snapshot {
     pub diagnostics: Diagnostics,
 }
 
+impl Snapshot {
+    pub fn apply_custom_names(&mut self, names: &BTreeMap<String, String>) {
+        for app in &mut self.miniapps {
+            if let Some(name) = names.get(&app.app_id) {
+                app.name = Some(name.clone());
+                app.metadata_source = Some("自定义名称".into());
+            }
+        }
+    }
+}
+
 /// What the scan saw and kept, for the coverage report.
 #[derive(Debug, Clone, Default)]
 pub struct Diagnostics {
@@ -125,7 +136,7 @@ pub struct Diagnostics {
     pub duration: std::time::Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PackageInfo {
     path: PathBuf,
     size: i64,
@@ -145,6 +156,7 @@ pub fn scan(custom_paths: &[String]) -> Snapshot {
 fn scan_paths(paths: &[String]) -> Snapshot {
     let mut snapshot = Snapshot::default();
     let mut packages_by_app: Vec<(String, Vec<PackageInfo>)> = Vec::new();
+    let mut app_indices: HashMap<String, usize> = HashMap::new();
     let mut icons: HashMap<String, (SystemTime, Vec<u8>)> = HashMap::new();
     let mut seen_packages = HashSet::new();
     let started = std::time::Instant::now();
@@ -163,92 +175,101 @@ fn scan_paths(paths: &[String]) -> Snapshot {
         }
         snapshot.readable_roots.push(root.clone());
 
-        let mut errors = 0;
-        let files = walk(&root, &mut errors);
-        snapshot.enumeration_errors += errors;
-        for (path, metadata) in files {
-            if let Some(icon_app) = app_id_from_icon(&path)
-                && metadata.is_file()
-                && metadata.len() <= 1_000_000
-                && let Ok(data) = std::fs::read(&path)
-            {
-                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                if icons.get(&icon_app).is_none_or(|(current, _)| *current < modified) {
-                    icons.insert(icon_app, (modified, data));
+        snapshot.enumeration_errors += walk(&root, |entry| {
+            let path = entry.path();
+            let icon_app = app_id_from_icon(&path);
+            if icon_app.is_none() && !extension_is(&path, "wxapkg") {
+                return;
+            }
+            let Ok(metadata) = std::fs::metadata(&path) else { return };
+            if !metadata.is_file() {
+                return;
+            }
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if let Some(app_id) = icon_app {
+                if metadata.len() <= 1_000_000
+                    && icons.get(&app_id).is_none_or(|(current, _)| *current < modified)
+                    && let Ok(data) = std::fs::read(&path)
+                {
+                    icons.insert(app_id, (modified, data));
                 }
-                continue;
+                return;
             }
-            if !extension_is(&path, "wxapkg") || !seen_packages.insert(identity_key(&path, Some(&metadata))) || !metadata.is_file() {
-                continue;
+            if !seen_packages.insert(identity_key(&path, Some(&metadata))) {
+                return;
             }
+            let size = metadata.len() as i64;
             snapshot.diagnostics.total_package_files += 1;
-            snapshot.diagnostics.total_package_bytes += metadata.len() as i64;
-            let Some(app_id) = app_id_from_path(&path) else { continue };
+            snapshot.diagnostics.total_package_bytes += size;
+            let Some(app_id) = app_id_from_path(&path) else { return };
             snapshot.diagnostics.identified_package_files += 1;
             let package = PackageInfo {
-                size: metadata.len() as i64,
-                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                size,
+                modified,
                 is_main: is_main_package(&path),
                 is_plugin: is_plugin_package(&path),
                 generation_key: generation_key(&path, &app_id),
                 path,
             };
-            match packages_by_app.iter_mut().find(|(id, _)| *id == app_id) {
-                Some((_, list)) => list.push(package),
-                None => packages_by_app.push((app_id, vec![package])),
+            snapshot.diagnostics.plugin_package_files += usize::from(package.is_plugin);
+            if let Some(&index) = app_indices.get(&app_id) {
+                packages_by_app[index].1.push(package);
+            } else {
+                app_indices.insert(app_id.clone(), packages_by_app.len());
+                packages_by_app.push((app_id, vec![package]));
             }
-        }
+        });
     }
 
-    for (app_id, packages) in &packages_by_app {
+    for (app_id, packages) in packages_by_app {
+        let groups = group_generations(&packages);
         if packages.iter().all(|package| package.is_plugin) {
-            snapshot.plugin_generations.insert(app_id.clone(), generations(packages));
+            snapshot.plugin_generations.insert(app_id, reported_generations(&groups, true, None));
             continue;
         }
-        let ranked = ranked_generations(packages);
-        let Some(selected) = ranked.first() else { continue };
-        let Some(main) = select_main_package(selected) else { continue };
+        let mut ranked: Vec<_> = groups.iter().filter_map(|group| Some((group, group.main()?))).collect();
+        // A total order keeps mixed numeric and named generations deterministic.
+        ranked.sort_by_cached_key(|(group, _)| std::cmp::Reverse(group.rank()));
+        let Some((&(selected, main), historical)) = ranked.split_first() else { continue };
 
-        let selected_paths: HashSet<&PathBuf> = selected.iter().map(|package| &package.path).collect();
-        let older: Vec<PackageInfo> =
-            packages.iter().filter(|package| !selected_paths.contains(&package.path) && !package.is_plugin).cloned().collect();
-        let older = generations(&older);
+        let older = reported_generations(&groups, false, Some(selected.directory()));
         snapshot.diagnostics.old_version_package_files += older.iter().map(|g| g.packages.len()).sum::<usize>();
         if !older.is_empty() {
             snapshot.older_generations.insert(app_id.clone(), older);
         }
 
-        let included: Vec<&PackageInfo> = selected.iter().filter(|package| !package.is_plugin || package.path == main.path).collect();
-        let mut sub_packages: Vec<PathBuf> =
-            included.iter().filter(|package| package.path != main.path).map(|package| package.path.clone()).collect();
+        let mut sub_packages = Vec::new();
+        let mut size = main.size;
+        let mut modified = main.modified;
+        for package in selected.members.iter().filter(|p| !p.is_plugin && p.path != main.path) {
+            size += package.size;
+            modified = modified.max(package.modified);
+            sub_packages.push(package.path.clone());
+        }
         sub_packages.sort_by(|a, b| natural_compare(&a.to_string_lossy(), &b.to_string_lossy()));
-        snapshot.diagnostics.selected_package_files += included.len();
-        let size = included.iter().map(|package| package.size).sum();
-        let modified = included.iter().map(|package| package.modified).max().unwrap_or(main.modified);
-        let metadata = resolve_metadata(app_id, &main, selected, packages);
-        let cached_icon = icons.contains_key(app_id);
-        let icon = icons.get(app_id).map(|(_, data)| data.clone()).or(metadata.icon.clone());
-        let metadata_source = match (&metadata.source, cached_icon) {
+        snapshot.diagnostics.selected_package_files += 1 + sub_packages.len();
+        let metadata = resolve_metadata(&app_id, main, selected, historical);
+        let cached_icon = icons.remove(&app_id).map(|(_, data)| data);
+        let metadata_source = match (metadata.source, cached_icon.is_some()) {
             (Some(source), true) => Some(format!("本地图标与{source}")),
-            (None, true) => Some("本地图标缓存".to_string()),
-            (source, false) => source.clone(),
+            (None, true) => Some("本地图标缓存".into()),
+            (source, false) => source,
         };
         snapshot.miniapps.push(Miniapp {
-            app_id: app_id.clone(),
+            app_id,
             name: metadata.name,
             main_package: main.path.clone(),
             sub_packages,
             size,
             modified,
             version: metadata.version,
-            icon,
+            icon: cached_icon.or(metadata.icon),
             metadata_source,
             declared_subpackage_roots: metadata.declared_subpackage_roots,
         });
     }
     snapshot.miniapps.sort_by_key(|app| std::cmp::Reverse(app.modified));
     let diagnostics = &mut snapshot.diagnostics;
-    diagnostics.plugin_package_files = packages_by_app.iter().flat_map(|(_, list)| list).filter(|p| p.is_plugin).count();
     diagnostics.plugin_only_app_count = snapshot.plugin_generations.len();
     diagnostics.resolved_name_count = snapshot.miniapps.iter().filter(|app| app.name.is_some()).count();
     diagnostics.resolved_icon_count = snapshot.miniapps.iter().filter(|app| app.icon.is_some()).count();
@@ -297,86 +318,90 @@ pub fn external_app(paths: &[PathBuf]) -> Option<Miniapp> {
     })
 }
 
-/// Groups packages by version directory, newest (numeric) first.
-fn generations(packages: &[PackageInfo]) -> Vec<Generation> {
-    let mut groups: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
-    for package in packages {
-        match groups.iter_mut().find(|(key, _)| *key == package.generation_key) {
-            Some((_, members)) => members.push(package.path.clone()),
-            None => groups.push((package.generation_key.clone(), vec![package.path.clone()])),
-        }
-    }
-    let mut result: Vec<Generation> = groups
-        .into_iter()
-        .map(|(key, mut members)| {
-            members.sort_by_key(|a| file_name(a));
-            Generation { version: file_name(&key), directory: key, packages: members }
-        })
-        .collect();
-    result.sort_by(|left, right| match (left.version.parse::<i64>(), right.version.parse::<i64>()) {
-        (Ok(l), Ok(r)) => r.cmp(&l),
-        _ => right.version.cmp(&left.version),
-    });
-    result
+struct CachedGeneration<'a> {
+    version: String,
+    members: Vec<&'a PackageInfo>,
+    newest: SystemTime,
+    explicit_main: Option<&'a PackageInfo>,
+    fallback_main: Option<&'a PackageInfo>,
 }
 
-fn ranked_generations(packages: &[PackageInfo]) -> Vec<Vec<PackageInfo>> {
-    let mut groups: Vec<Vec<PackageInfo>> = Vec::new();
-    for package in packages {
-        match groups.iter_mut().find(|group| group[0].generation_key == package.generation_key) {
-            Some(group) => group.push(package.clone()),
-            None => groups.push(vec![package.clone()]),
+impl<'a> CachedGeneration<'a> {
+    fn push(&mut self, package: &'a PackageInfo) {
+        self.members.push(package);
+        self.newest = self.newest.max(package.modified);
+        if package.is_plugin {
+            return;
+        }
+        if package.is_main && self.explicit_main.is_none_or(|main| main.modified < package.modified) {
+            self.explicit_main = Some(package);
+        }
+        if self.fallback_main.is_none_or(|main| (main.size, main.modified) < (package.size, package.modified)) {
+            self.fallback_main = Some(package);
         }
     }
-    groups.retain(|group| group.iter().any(|p| p.is_main) || group.iter().any(|p| !p.is_plugin));
-    groups.sort_by(|left, right| {
-        let left_main = left.iter().any(|p| p.is_main);
-        let right_main = right.iter().any(|p| p.is_main);
-        if left_main != right_main {
-            return right_main.cmp(&left_main);
-        }
-        let version = |group: &Vec<PackageInfo>| file_name(&group[0].generation_key).parse::<i64>().ok();
-        if let (Some(l), Some(r)) = (version(left), version(right))
-            && l != r
-        {
-            return r.cmp(&l);
-        }
-        let date = |group: &Vec<PackageInfo>| group.iter().map(|p| p.modified).max();
-        date(right).cmp(&date(left))
-    });
+
+    fn main(&self) -> Option<&'a PackageInfo> {
+        self.explicit_main.or(self.fallback_main)
+    }
+
+    fn directory(&self) -> &'a Path {
+        &self.members[0].generation_key
+    }
+
+    fn rank(&self) -> (bool, Option<i64>, SystemTime) {
+        (self.explicit_main.is_some(), self.version.parse().ok(), self.newest)
+    }
+}
+
+fn group_generations(packages: &[PackageInfo]) -> Vec<CachedGeneration<'_>> {
+    let mut indices = HashMap::new();
+    let mut groups = Vec::new();
+    for package in packages {
+        let index = *indices.entry(package.generation_key.as_path()).or_insert_with(|| {
+            let index = groups.len();
+            groups.push(CachedGeneration {
+                version: file_name(&package.generation_key),
+                members: Vec::new(),
+                newest: package.modified,
+                explicit_main: None,
+                fallback_main: None,
+            });
+            index
+        });
+        groups[index].push(package);
+    }
     groups
 }
 
-/// `max(by:)` keeps the first of equal maxima.
-fn first_max<'a, T>(items: impl Iterator<Item = &'a T>, mut less: impl FnMut(&T, &T) -> bool) -> Option<&'a T> {
-    let mut result = None;
-    for item in items {
-        match result {
-            None => result = Some(item),
-            Some(current) if less(current, item) => result = Some(item),
-            _ => {}
+fn reported_generations(groups: &[CachedGeneration<'_>], include_plugins: bool, exclude: Option<&Path>) -> Vec<Generation> {
+    let mut result = Vec::new();
+    for group in groups.iter().filter(|group| Some(group.directory()) != exclude) {
+        let mut members: Vec<_> = group.members.iter()
+            .filter(|p| include_plugins || !p.is_plugin)
+            .map(|p| p.path.clone())
+            .collect();
+        if !members.is_empty() {
+            members.sort_by_cached_key(|p| file_name(p));
+            result.push(Generation { version: group.version.clone(), directory: group.directory().to_path_buf(), packages: members });
         }
     }
+    result.sort_by(|left, right| {
+        match (left.version.parse::<i64>().ok(), right.version.parse::<i64>().ok()) {
+            (None, None) => right.version.cmp(&left.version),
+            (left, right) => right.cmp(&left),
+        }
+    });
     result
 }
 
-fn select_main_package(packages: &[PackageInfo]) -> Option<PackageInfo> {
-    if let Some(main) = first_max(packages.iter().filter(|p| p.is_main), |a, b| a.modified < b.modified) {
-        return Some(main.clone());
-    }
-    first_max(packages.iter().filter(|p| !p.is_plugin), |a, b| {
-        if a.size == b.size { a.modified < b.modified } else { a.size < b.size }
-    })
-    .cloned()
-}
-
-fn resolve_metadata(app_id: &str, main: &PackageInfo, selected: &[PackageInfo], all: &[PackageInfo]) -> Metadata {
+fn resolve_metadata(app_id: &str, main: &PackageInfo, selected: &CachedGeneration<'_>, historical: &[(&CachedGeneration<'_>, &PackageInfo)]) -> Metadata {
     let primary = package_metadata(&main.path, app_id);
     if primary.name.is_some() {
         return primary;
     }
     let mut remaining = MAXIMUM_METADATA_FALLBACK_PACKAGES;
-    let mut current: Vec<&PackageInfo> = selected.iter().filter(|p| p.path != main.path && !p.is_plugin).collect();
+    let mut current: Vec<_> = selected.members.iter().copied().filter(|p| p.path != main.path && !p.is_plugin).collect();
     current.sort_by(|a, b| b.size.cmp(&a.size).then(b.modified.cmp(&a.modified)));
     for package in current {
         if remaining == 0 {
@@ -389,14 +414,10 @@ fn resolve_metadata(app_id: &str, main: &PackageInfo, selected: &[PackageInfo], 
             return Metadata { name: Some(name), source: Some(source), ..primary };
         }
     }
-    for generation in ranked_generations(all) {
+    for &(_, historical) in historical {
         if remaining == 0 {
             break;
         }
-        if generation[0].generation_key == main.generation_key {
-            continue;
-        }
-        let Some(historical) = select_main_package(&generation) else { continue };
         remaining -= 1;
         let candidate = package_metadata(&historical.path, app_id);
         if let Some(name) = candidate.name {
@@ -475,31 +496,35 @@ fn is_likely_host_container(name: &str) -> bool {
     name.contains("tencent") || name.contains("wechat") || name.contains("weixin")
 }
 
-/// `NSDirectoryEnumerator` order: each entry in directory order, descending
-/// into a directory as soon as it is reached; links are not followed.
-fn walk(root: &Path, errors: &mut usize) -> Vec<(PathBuf, std::fs::Metadata)> {
-    fn visit(directory: &Path, errors: &mut usize, result: &mut Vec<(PathBuf, std::fs::Metadata)>) {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            *errors += 1;
-            return;
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                *errors += 1;
+/// Depth-first iteration in directory order without retaining the entire tree.
+/// Directory symlinks are never traversed.
+fn walk(root: &Path, mut file: impl FnMut(std::fs::DirEntry)) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else { return 1 };
+    let mut stack = vec![entries];
+    let mut errors = 0;
+    while let Some(entries) = stack.last_mut() {
+        let entry = match entries.next() {
+            Some(Ok(entry)) => entry,
+            Some(Err(_)) => {
+                errors += 1;
                 continue;
-            };
-            let path = entry.path();
-            let Ok(link_metadata) = std::fs::symlink_metadata(&path) else { continue };
-            let metadata = std::fs::metadata(&path).unwrap_or_else(|_| link_metadata.clone());
-            result.push((path.clone(), metadata));
-            if link_metadata.is_dir() {
-                visit(&path, errors, result);
             }
+            None => {
+                stack.pop();
+                continue;
+            }
+        };
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => match std::fs::read_dir(entry.path()) {
+                Ok(children) => stack.push(children),
+                Err(_) => errors += 1,
+            },
+            Ok(kind) if kind.is_file() || kind.is_symlink() => file(entry),
+            Ok(_) => {}
+            Err(_) => errors += 1,
         }
     }
-    let mut result = Vec::new();
-    visit(root, errors, &mut result);
-    result
+    errors
 }
 
 fn identity_key(path: &Path, metadata: Option<&std::fs::Metadata>) -> String {
@@ -641,16 +666,19 @@ mod tests {
         let sub = fixture.package("account A/Applet/wx0123456789abcdef/2/sub.wxapkg");
         fixture.package("account B/Applet/wx1111111111111111/1/__APP__.wxapkg");
         fixture.package("account A/Applet/wx2222222222222222/1/PLUGINS/plugin.wxapkg");
+        fixture.package("account A/Applet/wx0123456789abcdef/3/PLUGINS/__APP__.wxapkg");
+        fixture.package("account A/Applet/wx0123456789abcdef/foo/__APP__.wxapkg");
         let pattern = fixture.0.join("*/Applet").to_string_lossy().into_owned();
         // Duplicate roots and mixed path separators must not duplicate packages.
         let snapshot = scan_paths(&[pattern, fixture.0.join("account A/Applet").to_string_lossy().into_owned()]);
         assert_eq!(snapshot.miniapps.len(), 2);
-        assert_eq!(snapshot.diagnostics.total_package_files, 5);
+        assert_eq!(snapshot.diagnostics.total_package_files, 7);
         let app = snapshot.miniapps.iter().find(|app| app.app_id == "wx0123456789abcdef").unwrap();
         assert!(crate::platform::paths_equal(&app.main_package, &main));
         assert_eq!(app.sub_packages.len(), 1);
         assert!(crate::platform::paths_equal(&app.sub_packages[0], &sub));
-        assert_eq!(snapshot.older_generations[&app.app_id].len(), 1);
+        let older = &snapshot.older_generations[&app.app_id];
+        assert_eq!(older.iter().map(|g| g.version.as_str()).collect::<Vec<_>>(), ["1", "foo"]);
         assert_eq!(snapshot.plugin_generations["wx2222222222222222"].len(), 1);
         assert_eq!(snapshot.enumeration_errors, 0);
     }

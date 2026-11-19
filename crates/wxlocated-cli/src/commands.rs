@@ -1,6 +1,6 @@
-//! The agent-facing commands. Every command writes one JSON document to
-//! stdout in the exact format of the Swift CLI it replaces.
+//! JSON commands and their shared cache lookup.
 
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use serde_json::{Value, json};
@@ -12,26 +12,17 @@ use wxlocated_engine::swift_json::iso8601;
 pub const SCHEMA_VERSION: i64 = 2;
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub static SCAN_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-
 pub const ACCESS_HINT: &str = if cfg!(target_os = "macos") {
     "部分缓存目录无权读取：在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许当前终端或 Agent 宿主应用"
 } else {
     "部分缓存目录无权读取：请确认当前用户具有缓存目录的读取权限，或在设置中添加可读取的 Applet 缓存目录"
 };
 
-/// A scan with custom names applied, as the Swift `ScannerViewModel` gives it.
-pub fn scan_cache() -> Snapshot {
-    let settings = Settings::load();
-    let paths: Vec<_> = settings.custom_scan_paths.iter().cloned()
-        .chain(SCAN_PATHS.get().into_iter().flatten().cloned()).collect();
-    let mut snapshot = scan::scan(&paths);
-    for app in &mut snapshot.miniapps {
-        if let Some(name) = settings.custom_app_names.get(&app.app_id) {
-            app.name = Some(name.clone());
-            app.metadata_source = Some("自定义名称".into());
-        }
-    }
+pub fn scan_cache(extra_paths: &[String]) -> Snapshot {
+    let mut settings = Settings::load();
+    settings.custom_scan_paths.extend_from_slice(extra_paths);
+    let mut snapshot = scan::scan(&settings.custom_scan_paths);
+    snapshot.apply_custom_names(&settings.custom_app_names);
     snapshot
 }
 
@@ -43,12 +34,9 @@ fn file_name(path: &std::path::Path) -> String {
     path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-pub fn list() -> Value {
-    let snapshot = scan_cache();
-    let mut apps: Vec<&Miniapp> = snapshot.miniapps.iter().collect();
-    apps.sort_by_key(|app| std::cmp::Reverse(app.modified));
-    let miniapps: Vec<Value> = apps
-        .iter()
+pub fn list(scan_paths: &[String]) -> Value {
+    let snapshot = scan_cache(scan_paths);
+    let miniapps: Vec<Value> = snapshot.miniapps.iter()
         .map(|app| {
             let completeness = Completeness::new(app, None, &Context::default());
             let mut entry = json!({
@@ -105,24 +93,30 @@ impl Failure {
     }
 }
 
-/// The first argument that is not an option (or an option's value).
-pub fn positional(args: &[String], command: &str) -> Result<String, Failure> {
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
+pub fn option_value<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {
+    args.windows(2)
+        .find(|pair| flags.contains(&pair[0].as_str()))
+        .map(|pair| pair[1].as_str())
+}
+
+pub fn positionals<'a>(args: &'a [String], valued_flags: &[&str]) -> impl Iterator<Item = &'a str> {
+    let mut args = args.iter().map(String::as_str);
+    std::iter::from_fn(move || {
+        while let Some(arg) = args.next() {
+            if valued_flags.contains(&arg) {
+                args.next();
+            } else if !arg.starts_with('-') {
+                return Some(arg);
+            }
         }
-        if arg == "--out" || arg == "-o" {
-            skip_next = true;
-            continue;
-        }
-        if arg.starts_with('-') {
-            continue;
-        }
-        return Ok(arg.clone());
-    }
-    Err(Failure { exit: EXIT_USAGE, code: "missing_app", message: format!("{command} 需要一个 AppID 或小程序名称"), hint: None })
+        None
+    })
+}
+
+pub fn app_query<'a>(args: &'a [String], command: &str, valued_flags: &[&str]) -> Result<&'a str, Failure> {
+    positionals(args, valued_flags).next().ok_or_else(|| Failure {
+        exit: EXIT_USAGE, code: "missing_app", message: format!("{command} 需要一个 AppID 或小程序名称"), hint: None,
+    })
 }
 
 /// By AppID, else by a unique name.
@@ -148,29 +142,29 @@ pub fn resolve_app<'a>(snapshot: &'a Snapshot, query: &str) -> Result<&'a Miniap
     }
 }
 
-pub fn info(args: &[String]) -> Result<Value, Failure> {
-    let query = positional(args, "info")?;
-    let snapshot = scan_cache();
-    let app = resolve_app(&snapshot, &query)?;
+pub fn info(args: &[String], scan_paths: &[String]) -> Result<Value, Failure> {
+    let query = app_query(args, "info", &[])?;
+    let snapshot = scan_cache(scan_paths);
+    let app = resolve_app(&snapshot, query)?;
     Ok(report::inspect(app, &Context::for_app(&snapshot, app)))
 }
 
-/// `~` expanded; relative paths stay relative to the current directory.
-pub fn expand_tilde(path: &str) -> std::path::PathBuf {
-    wxlocated_engine::platform::expand_path(path)
+pub fn absolute_path(path: &str) -> PathBuf {
+    let expanded = wxlocated_engine::platform::expand_path(path);
+    let joined = std::env::current_dir().unwrap_or_default().join(expanded);
+    joined.components().collect()
 }
 
-pub fn export(args: &[String]) -> Result<Value, Failure> {
+pub fn export(args: &[String], scan_paths: &[String]) -> Result<Value, Failure> {
     use wxlocated_engine::material::export::{MaterialExportError, Options, export};
-    let query = positional(args, "export")?;
-    let out = args
-        .iter()
-        .position(|arg| arg == "--out" || arg == "-o")
-        .and_then(|index| args.get(index + 1))
+    const OUTPUT_FLAGS: &[&str] = &["--out", "-o"];
+    let query = app_query(args, "export", OUTPUT_FLAGS)?;
+    let out = option_value(args, OUTPUT_FLAGS)
+        .filter(|value| !value.starts_with('-'))
         .ok_or(Failure { exit: EXIT_USAGE, code: "missing_output", message: "export 需要 --out <目录>".into(), hint: None })?;
-    let parent = std::env::current_dir().unwrap_or_default().join(expand_tilde(out));
-    let snapshot = scan_cache();
-    let app = resolve_app(&snapshot, &query)?;
+    let parent = absolute_path(out);
+    let snapshot = scan_cache(scan_paths);
+    let app = resolve_app(&snapshot, query)?;
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
     let options = Options {
         replace_existing: has("--force"),
@@ -189,15 +183,7 @@ pub fn export(args: &[String]) -> Result<Value, Failure> {
 }
 
 pub fn trace(args: &[String]) -> Result<Value, Failure> {
-    let current = std::env::current_dir().unwrap_or_default();
-    // `URL(fileURLWithPath:isDirectory:).path`: absolute, no trailing slash.
-    let root = |path: &str| {
-        let joined = current.join(expand_tilde(path));
-        let text = joined.to_string_lossy().into_owned();
-        let trimmed = text.trim_end_matches('/');
-        std::path::PathBuf::from(if trimmed.is_empty() { "/" } else { trimmed })
-    };
-    wxlocated_engine::trace::trace(args, root)
+    wxlocated_engine::trace::trace(args, absolute_path)
         .map_err(|failure| Failure { exit: failure.exit, code: failure.code, message: failure.message, hint: None })
 }
 

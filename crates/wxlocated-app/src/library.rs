@@ -107,12 +107,7 @@ impl Library {
         let external = self.external.clone();
         let task = cx.background_executor().spawn(async move {
             let mut snapshot = scan::scan(&paths);
-            for app in &mut snapshot.miniapps {
-                if let Some(name) = names.get(&app.app_id) {
-                    app.name = Some(name.clone());
-                    app.metadata_source = Some("自定义名称".into());
-                }
-            }
+            snapshot.apply_custom_names(&names);
             let derived: HashMap<String, Derived> = snapshot.miniapps.iter().chain(external.iter()).map(|app| {
                 let context = wxlocated_engine::material::Context::for_app(&snapshot, app);
                 (app.app_id.clone(), derive(app, &context))
@@ -146,11 +141,6 @@ impl Library {
     /// Read-only view of `derived`, for render code that only has `&self`.
     pub fn derived_ref(&self, app_id: &str) -> Derived {
         self.derived.get(app_id).copied().unwrap_or_default()
-    }
-
-    /// Facts are populated by background work; rendering never opens packages.
-    pub fn derived(&mut self, app: &Miniapp) -> Derived {
-        self.derived_ref(&app.app_id)
     }
 
     /// Watches the readable cache folders and rescans a moment after WeChat
@@ -203,11 +193,6 @@ impl Library {
         self.apps().iter().find(|app| app.app_id == app_id).or_else(|| self.external.iter().find(|app| app.app_id == app_id))
     }
 
-    /// Recently opened apps that are still cached, most recent first.
-    pub fn recent_apps(&self) -> Vec<Miniapp> {
-        self.settings.recent_app_ids.iter().filter_map(|id| self.apps().iter().find(|app| app.app_id == *id)).cloned().collect()
-    }
-
     pub fn record_use(&mut self, app_id: &str, cx: &mut Context<Self>) {
         if self.settings.recent_app_ids.first().map(String::as_str) == Some(app_id) {
             return;
@@ -240,7 +225,7 @@ impl Library {
     /// The app's icon as a GPUI image (decoded lazily by GPUI) and its glow
     /// colour, sampled during the scan.
     pub fn icon(&mut self, app: &Miniapp) -> (Option<Arc<Image>>, Option<Hsla>) {
-        let ambient = self.derived(app).ambient;
+        let ambient = self.derived_ref(&app.app_id).ambient;
         if let Some(icon) = self.icons.get(&app.app_id) {
             return (Some(icon.clone()), ambient);
         }

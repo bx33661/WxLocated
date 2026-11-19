@@ -4,7 +4,7 @@
 
 基于 Rust + GPUI 的微信小程序本地工作台：定位缓存、解包解密、静态重建源码，导出带来源与 SHA-256 的审计材料，支持桌面查看和 Agent JSON CLI。
 
-[![Windows 10/11 x64](https://img.shields.io/badge/Windows-10%2F11_x64-0078D4)](#windows)
+[![Windows x64 / ARM64](https://img.shields.io/badge/Windows-x64%20%2F%20ARM64-0078D4)](#windows)
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-111111?logo=apple)](#quick-start)
 [![Rust](https://img.shields.io/badge/Rust-2024-B7410E?logo=rust)](Cargo.toml)
 [![GPUI](https://img.shields.io/badge/UI-GPUI-38A89D)](crates/wxlocated-app)
@@ -24,7 +24,9 @@
 
 ## 快速开始
 
-支持 **Windows 10/11 x64** 和 **macOS 14+**。macOS 需要 Xcode Command Line Tools 与 [rustup](https://rustup.rs/)，支持 Apple Silicon 和 Intel。Windows 构建要求见[下文](#windows)。
+从 [GitHub Releases](https://github.com/bx33661/WxLocated/releases/latest) 下载。Windows 10/11 选 x64 ZIP，Windows 11 ARM 选 ARM64 ZIP。macOS 14+ 使用 Universal 包，支持 Apple Silicon 和 Intel。
+
+macOS 从源码运行需要 Xcode Command Line Tools 和 [rustup](https://rustup.rs/)。Windows 构建要求见[下文](#windows)。
 
 ```bash
 git clone https://github.com/bx33661/WxLocated.git
@@ -91,7 +93,7 @@ cargo test --workspace
 
 源码构建需要：
 
-- [rustup](https://rustup.rs/)，使用 MSVC 工具链（`x86_64-pc-windows-msvc`）。Rust 版本由 `rust-toolchain.toml` 固定。
+- [rustup](https://rustup.rs/) 和 MSVC 工具链。x64 使用 `x86_64-pc-windows-msvc`，ARM64 使用 `aarch64-pc-windows-msvc`。Rust 版本由 `rust-toolchain.toml` 固定。
 - Visual Studio 2022 Build Tools 的“使用 C++ 的桌面开发”，包括 MSVC 和 Windows 10/11 SDK。
 - Release 构建需要 SDK 中的 `fxc.exe` 编译 GPUI 的 DirectX 着色器。通常自动发现，也可通过 `GPUI_FXC_PATH` 指定完整路径。
 
@@ -102,9 +104,10 @@ cargo build -p wxlocated-cli
 cargo run -p wxlocated-app
 cargo test --workspace
 ./scripts/bundle-windows.ps1
+./scripts/bundle-windows.ps1 -Target aarch64-pc-windows-msvc
 ```
 
-打包脚本生成 `target/bundle/windows/WxLocated-<版本>-windows-x64.zip` 和 SHA-256 校验文件；`-DebugBuild` 可生成开发包。解压后运行 `wxlocated-app.exe`，保留同目录下的 `wxlocated.exe` 供设置页和 Agent 使用。运行机器需要 [Microsoft Visual C++ 2015–2022 x64 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)。
+ZIP 和 SHA-256 校验文件位于 `target/bundle/windows/`，文件名以 `windows-x64` 或 `windows-arm64` 结尾。解压后运行 `wxlocated-app.exe`，保留同目录下的 `wxlocated.exe`。运行需要相应架构的 [VC++ x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) 或 [VC++ ARM64](https://aka.ms/vs/17/release/vc_redist.arm64.exe) 运行库。
 
 包中的 `install-windows.ps1` 可选安装开始菜单快捷方式，并把 WxLocated 加入 `.wxapkg` 的“打开方式”，无需管理员权限，也不修改默认打开应用。移动或删除目录前运行 `./install-windows.ps1 -Uninstall` 清理这些注册。
 

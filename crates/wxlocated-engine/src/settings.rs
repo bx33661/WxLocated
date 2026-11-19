@@ -84,11 +84,25 @@ impl Settings {
     /// Writes `settings.json`; from then on it is the only source.
     pub fn save(&self) -> std::io::Result<()> {
         let path = settings_path().ok_or_else(|| std::io::Error::other("no settings folder"))?;
+        self.save_to(path)
+    }
+
+    fn save_to(&self, path: PathBuf) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let text = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        let pending = path.with_extension(format!("{}.tmp", crate::export::uuid_string()));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, text + "\n")
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&pending)?;
+        let written = file.write_all(&text).and_then(|()| file.write_all(b"\n"));
+        drop(file);
+        let result = written.and_then(|()| std::fs::rename(&pending, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(pending);
+        }
+        result
     }
 }
 
@@ -161,6 +175,22 @@ mod tests {
     fn unknown_fields_are_ignored() {
         let settings: Settings = serde_json::from_str(r#"{"future_field":1,"sort_order":"name"}"#).expect("parses");
         assert_eq!(settings.sort_order, "name");
+    }
+
+    #[test]
+    fn saves_over_an_existing_settings_file() -> std::io::Result<()> {
+        let directory = std::env::temp_dir().join(crate::export::uuid_string());
+        let path = directory.join("settings.json");
+        let result = (|| {
+            Settings::default().save_to(path.clone())?;
+            let updated = Settings { appearance: "dark".into(), ..Settings::default() };
+            updated.save_to(path.clone())?;
+            let stored: Settings = serde_json::from_slice(&std::fs::read(path)?)?;
+            assert_eq!(stored.appearance, "dark");
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(directory);
+        result
     }
 
     #[test]

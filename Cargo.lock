@@ -8532,7 +8532,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "wxlocated-app"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-channel",
  "chrono",
@@ -8549,7 +8549,7 @@ dependencies = [
 
 [[package]]
 name = "wxlocated-cli"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "embed-resource",
  "hex",
@@ -8561,7 +8561,7 @@ dependencies = [
 
 [[package]]
 name = "wxlocated-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes 0.9.4",
  "directories",
