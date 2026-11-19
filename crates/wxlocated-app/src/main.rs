@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! WxLocated desktop app (GPUI). The same engine as the `wxlocated` CLI.
 
 mod diff;
@@ -7,7 +9,7 @@ mod library;
 mod native_open;
 mod quick_open;
 mod settings_view;
-#[cfg(feature = "snapshot")]
+#[cfg(all(feature = "snapshot", target_os = "macos"))]
 mod snapshot;
 mod theme;
 mod ui;
@@ -67,9 +69,9 @@ fn open_gallery(cx: &mut App) {
         return;
     };
     cx.set_global(GalleryWindow(window));
-    #[cfg(feature = "snapshot")]
+    #[cfg(all(feature = "snapshot", target_os = "macos"))]
     snapshot::schedule(window, gallery, cx);
-    #[cfg(not(feature = "snapshot"))]
+    #[cfg(not(all(feature = "snapshot", target_os = "macos")))]
     let _ = gallery;
     if focus {
         cx.activate(true);
@@ -113,6 +115,16 @@ fn main() {
         })
         .detach();
         open_gallery(cx);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let paths: Vec<_> = std::env::args_os().skip(1).map(std::path::PathBuf::from).collect();
+            if !paths.is_empty() {
+                native_open::open_paths(&paths, cx);
+            }
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() { cx.quit(); }
+            }).detach();
+        }
         cx.spawn(async move |cx| {
             while let Ok(paths) = received.recv().await {
                 cx.update(|cx| native_open::open_urls(paths, cx));
@@ -150,23 +162,25 @@ fn bind(cx: &mut App) {
         }
     });
 
+    use ui::key_binding as key;
     cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-h", HideApp, None),
-        KeyBinding::new("cmd-r", Refresh, None),
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-o", QuickOpen, None),
-        KeyBinding::new("cmd-shift-1", ShowGallery, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-e", ExportMaterial, Some("Workspace")),
-        KeyBinding::new("cmd-0", ShowOverview, Some("Workspace")),
-        KeyBinding::new("alt-cmd-r", ToggleRaw, Some("Workspace")),
-        KeyBinding::new("alt-cmd-0", ToggleInspector, Some("Workspace")),
-        KeyBinding::new("cmd-[", BackToGallery, Some("Workspace")),
-        KeyBinding::new("cmd-shift-o", FocusFilter, Some("Workspace")),
-        KeyBinding::new("cmd-f", FocusSearch, Some("Gallery")),
+        KeyBinding::new(key("cmd-q", "ctrl-q"), Quit, None),
+        KeyBinding::new(key("cmd-r", "ctrl-r"), Refresh, None),
+        KeyBinding::new(key("cmd-,", "ctrl-,"), OpenSettings, None),
+        KeyBinding::new(key("cmd-o", "ctrl-o"), QuickOpen, None),
+        KeyBinding::new(key("cmd-shift-1", "ctrl-shift-1"), ShowGallery, None),
+        KeyBinding::new(key("cmd-w", "ctrl-w"), CloseWindow, None),
+        KeyBinding::new(key("cmd-m", "ctrl-m"), Minimize, None),
+        KeyBinding::new(key("cmd-e", "ctrl-e"), ExportMaterial, Some("Workspace")),
+        KeyBinding::new(key("cmd-0", "ctrl-0"), ShowOverview, Some("Workspace")),
+        KeyBinding::new(key("alt-cmd-r", "alt-ctrl-r"), ToggleRaw, Some("Workspace")),
+        KeyBinding::new(key("alt-cmd-0", "alt-ctrl-0"), ToggleInspector, Some("Workspace")),
+        KeyBinding::new(key("cmd-[", "ctrl-["), BackToGallery, Some("Workspace")),
+        KeyBinding::new(key("cmd-shift-o", "ctrl-shift-o"), FocusFilter, Some("Workspace")),
+        KeyBinding::new(key("cmd-f", "ctrl-f"), FocusSearch, Some("Gallery")),
     ]);
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([KeyBinding::new("cmd-h", HideApp, None)]);
 
     cx.set_menus(vec![
         Menu {
@@ -177,6 +191,7 @@ fn bind(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("设置…", OpenSettings),
                 MenuItem::separator(),
+                #[cfg(target_os = "macos")]
                 MenuItem::action("隐藏 WxLocated", HideApp),
                 MenuItem::action("退出 WxLocated", Quit),
             ],

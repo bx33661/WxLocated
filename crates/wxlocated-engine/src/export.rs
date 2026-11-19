@@ -180,7 +180,10 @@ fn write_contents(result: &Decompilation, duration_seconds: f64, set: &PackageSe
 fn validate_paths<'a>(paths: impl Iterator<Item = &'a str> + Clone) -> Result<(), ExportError> {
     let mut known: HashSet<String> = HashSet::from([folded("WxLocated-decompilation.json")]);
     for path in paths.clone() {
-        if normalized_path(path).as_deref() != Some(path) || !known.insert(folded(path)) {
+        if normalized_path(path).as_deref() != Some(path)
+            || cfg!(windows) && !path.split('/').all(crate::platform::windows_safe_component)
+            || !known.insert(folded(path))
+        {
             return Err(ExportError::PathConflict(path.to_string()));
         }
     }
@@ -202,6 +205,9 @@ fn folded(path: &str) -> String {
 }
 
 fn sanitized_folder_name(value: &str) -> String {
+    if cfg!(windows) {
+        return crate::platform::safe_file_name(value);
+    }
     let pieces: Vec<&str> =
         value.split(|c: char| c == '/' || c == ':' || c == '\0' || c.is_control() || matches!(c, '\u{85}' | '\u{2028}' | '\u{2029}')).filter(|p| !p.is_empty()).collect();
     let joined = pieces.join("-");

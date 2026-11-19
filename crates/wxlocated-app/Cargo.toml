@@ -24,6 +24,9 @@ wxlocated-engine = { version = "1.0.0", path = "../wxlocated-engine" }
 # Only for the dev `snapshot` feature (render_to_image lives here).
 gpui-pre-macos = { version = "=0.3.11", optional = true }
 
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [features]
 # Dev only: render windows to PNG without showing them (see snapshot.rs).
 snapshot = ["dep:gpui-pre-macos", "gpui-pre-macos/test-support"]

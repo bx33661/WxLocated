@@ -13,6 +13,7 @@
 /docs/
 *.[mM][dD]
 !/README.md
+!/TODO-windows.md
 
 # Rust
 /target/

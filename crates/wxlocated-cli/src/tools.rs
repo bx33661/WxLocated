@@ -333,7 +333,7 @@ pub fn watch(args: &[String]) -> Result<u8, Failure> {
 
 /// `~/.local/bin/wxlocated`, a shim forwarding to the installed binary.
 pub fn shim_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/bin/wxlocated")
+    wxlocated_engine::platform::cli_install_path().unwrap_or_default()
 }
 
 fn os_version() -> String {
@@ -349,7 +349,9 @@ fn os_version() -> String {
         };
         format!("Version {} (Build {})", sysctl("kern.osproductversion"), sysctl("kern.osversion"))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    { wxlocated_engine::platform::windows_version() }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         std::env::consts::OS.to_string()
     }
@@ -377,7 +379,7 @@ pub fn doctor() -> (Value, u8) {
             "disk_access",
             "fail",
             format!("{} 个缓存目录无权读取：{}", snapshot.inaccessible_roots.len(), roots(&snapshot.inaccessible_roots)),
-            Some("在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许运行 wxlocated 的终端或 Agent 宿主应用，然后重启它".into()),
+            Some(crate::commands::ACCESS_HINT.into()),
         ));
     }
     if snapshot.readable_roots.is_empty() {
@@ -385,7 +387,7 @@ pub fn doctor() -> (Value, u8) {
             "cache_roots",
             "fail",
             "没有找到可读取的小程序缓存目录".into(),
-            Some("确认已在 Mac 版微信中打开过小程序；缓存位置特殊时，在 WxLocated 设置中添加 Applet 缓存目录".into()),
+            Some("确认已在电脑版微信中打开过小程序；缓存位置特殊时，在 WxLocated 设置中添加 Applet 缓存目录".into()),
         ));
     } else {
         checks.push(check(
@@ -410,22 +412,27 @@ pub fn doctor() -> (Value, u8) {
     }
     match wechat_client_version() {
         Some(version) => checks.push(check("wechat", "ok", format!("微信 {version}"), None)),
-        None => checks.push(check("wechat", "warn", "未在 /Applications 找到微信，material.json 将不记录客户端版本".into(), None)),
+        None => checks.push(check("wechat", "warn", "未检测到微信客户端版本，material.json 将不记录客户端版本".into(), None)),
     }
 
     let executable = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let shim = shim_path();
     let shim_directory = shim.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let on_path = std::env::var("PATH").unwrap_or_default().split(':').any(|entry| entry == shim_directory);
+    let on_path = wxlocated_engine::platform::directory_on_path(std::path::Path::new(&shim_directory));
+    let direct_on_path = std::path::Path::new(&executable).parent().is_some_and(wxlocated_engine::platform::directory_on_path);
+    let expected_shim = wxlocated_engine::platform::cli_wrapper(std::path::Path::new(&executable)).ok();
+    let shim_matches = |contents: &String| expected_shim.as_ref().is_some_and(|expected| expected == contents)
+        || !cfg!(windows) && contents.contains(&executable);
     match std::fs::read_to_string(&shim) {
-        Ok(contents) if contents.contains(&executable) && on_path => {
+        _ if direct_on_path => checks.push(check("cli", "ok", format!("命令行程序所在目录已加入 PATH：{executable}"), None)),
+        Ok(contents) if shim_matches(&contents) && on_path => {
             checks.push(check("cli", "ok", format!("wxlocated 已安装在 {}", shim.to_string_lossy()), None));
         }
-        Ok(contents) if contents.contains(&executable) => checks.push(check(
+        Ok(contents) if shim_matches(&contents) => checks.push(check(
             "cli",
             "warn",
-            format!("wxlocated 已安装，但 {shim_directory} 不在 PATH 中"),
-            Some("在 shell 配置中加入 export PATH=\"$HOME/.local/bin:$PATH\"".into()),
+            format!("wxlocated 已安装，但 {} 不在当前进程的 PATH 中", shim.parent().unwrap_or(&shim).display()),
+            Some(if cfg!(windows) { "重新打开终端或 WxLocated 以加载用户 PATH；仍不可用时，在用户环境变量 Path 中加入命令行安装目录".into() } else { "在 shell 配置中加入 export PATH=\"$HOME/.local/bin:$PATH\"".into() }),
         )),
         Ok(_) => checks.push(check("cli", "warn", "wxlocated 指向另一份 WxLocated".into(), Some("在 WxLocated 设置 › Agent 中重新安装命令行工具".into()))),
         Err(_) => checks.push(check(
@@ -441,7 +448,10 @@ pub fn doctor() -> (Value, u8) {
         "schema_version": SCHEMA_VERSION,
         "ok": !failed,
         "tool_version": TOOL_VERSION,
-        "macos_version": os_version(),
+        "os": std::env::consts::OS,
+        "os_version": os_version(),
+        // Kept for existing macOS consumers; Windows uses os/os_version.
+        "macos_version": if cfg!(target_os = "macos") { Some(os_version()) } else { None },
         "executable": executable,
         "checks": checks,
     });

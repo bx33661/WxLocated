@@ -56,7 +56,7 @@ pub struct Gallery {
 impl Gallery {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let library = Library::global(cx);
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("名称、AppID 或路径  ⌘F"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(crate::ui::shortcut("名称、AppID 或路径  ⌘F")));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("小程序名称"));
         let subscriptions = vec![
             cx.observe(&library, |this, library, cx| {
@@ -149,7 +149,7 @@ impl Gallery {
         cx.notify();
     }
 
-    #[cfg(feature = "snapshot")]
+    #[cfg(all(feature = "snapshot", target_os = "macos"))]
     pub fn select_for_snapshot(&mut self, app_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.select(app_id, window, cx);
     }
@@ -461,7 +461,7 @@ impl Gallery {
                     .ghost()
                     .small()
                     .loading(scanning)
-                    .tooltip("重新扫描（⌘R）")
+                    .tooltip(crate::ui::shortcut("重新扫描（⌘R）"))
                     .on_click(cx.listener(|this, _, _, cx| this.library.update(cx, |library, cx| library.refresh(cx)))),
             )
             .child(
@@ -471,13 +471,13 @@ impl Gallery {
                     .ghost()
                     .small()
                     .dropdown_menu_with_anchor(Anchor::TopRight, |menu, _, _| {
-                        menu.item(PopupMenuItem::new("打开小程序…  ⌘O").icon(IconName::Search).on_click(|_, _, cx| crate::quick_open::open(cx)))
+                        menu.item(PopupMenuItem::new(crate::ui::shortcut("打开小程序…  ⌘O")).icon(IconName::Search).on_click(|_, _, cx| crate::quick_open::open(cx)))
                             .item(PopupMenuItem::new("添加缓存目录…").icon(IconName::FolderPlus).on_click(|_, _, cx| crate::settings_view::add_folder(cx)))
                             .item(PopupMenuItem::new("扫描诊断…").icon(IconName::Activity).on_click(|_, _, cx| {
                                 crate::settings_view::open_settings(Some(crate::settings_view::Tab::Scan), cx)
                             }))
                             .separator()
-                            .item(PopupMenuItem::new("设置…  ⌘,").icon(IconName::Settings).on_click(|_, _, cx| crate::settings_view::open_settings(None, cx)))
+                            .item(PopupMenuItem::new(crate::ui::shortcut("设置…  ⌘,")).icon(IconName::Settings).on_click(|_, _, cx| crate::settings_view::open_settings(None, cx)))
                     }),
             ),
         )
@@ -755,7 +755,7 @@ impl Gallery {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Button::new("bar-reveal").icon(IconName::FolderOpen).accessibility_label("在 Finder 中显示缓存目录").ghost().small().tooltip("在 Finder 中显示").on_click(move |_, _, cx| cx.reveal_path(&folder)))
+                    .child(Button::new("bar-reveal").icon(IconName::FolderOpen).accessibility_label("显示缓存目录").ghost().small().tooltip("显示缓存目录").on_click(move |_, _, cx| cx.reveal_path(&folder)))
                     .child(
                         Button::new("bar-copy")
                             .icon(if copied { IconName::Check } else { IconName::Copy })
@@ -816,9 +816,13 @@ impl Gallery {
         let message = if scanning {
             "正在查找微信缓存中的小程序包…"
         } else if inaccessible {
-            "部分缓存目录没有访问权限。在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许 WxLocated，然后重新扫描。"
+            if cfg!(target_os = "macos") {
+                "部分缓存目录没有访问权限。在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许 WxLocated，然后重新扫描。"
+            } else {
+                "部分缓存目录没有访问权限。请确认当前用户具有读取权限，或添加可读取的 Applet 缓存目录。"
+            }
         } else if readable == 0 {
-            "没有找到微信小程序缓存目录。确认已在 Mac 版微信中打开过小程序；缓存位置特殊时可以添加目录。"
+            "没有找到微信小程序缓存目录。确认已在电脑版微信中打开过小程序；缓存位置特殊时可以添加目录。"
         } else {
             "在微信中打开过的小程序会出现在这里。打开目标小程序后重新扫描，或者把 .wxapkg 文件拖进这个窗口。"
         };
@@ -878,7 +882,7 @@ fn app_context_menu(menu: PopupMenu, app: &Miniapp, gallery: WeakEntity<Gallery>
     menu.item(item("打开", IconName::ArrowUpRight, Box::new(|this, app, _, cx| this.open(&app.app_id, cx))))
         .item(item("快速查看", IconName::Eye, Box::new(|this, app, window, cx| this.quick_look(app, window, cx))))
         .separator()
-        .item(item("在 Finder 中显示", IconName::FolderOpen, Box::new(|_, app, _, cx| cx.reveal_path(&app.cache_directory()))))
+        .item(item("显示缓存目录", IconName::FolderOpen, Box::new(|_, app, _, cx| cx.reveal_path(&app.cache_directory()))))
         .item(item("复制路径", IconName::Copy, Box::new(|this, app, _, cx| this.copy_path(&app, cx))))
         .item(item("复制 AppID", IconName::Hash, Box::new(|_, app, _, cx| ui::copy(app.app_id.clone(), cx))))
         .item(item("设置显示名称…", IconName::Pencil, Box::new(|this, app, window, cx| this.start_rename(app, window, cx))))

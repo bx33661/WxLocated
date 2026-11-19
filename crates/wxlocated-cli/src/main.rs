@@ -101,6 +101,7 @@ const USAGE: &str = "wxlocated — 为 Agent 提供本机微信小程序审计�
 
 选项：
   --compact   单行 JSON
+  --scan-path <目录>   添加本次扫描的缓存目录，可重复指定；支持 ~ 和 %环境变量%
 
 退出码：0 成功 · 64 用法错误 · 66 未找到 · 70 执行失败 · 75 watch 超时
 stdout 只输出 JSON；进度写入 stderr。
@@ -110,6 +111,17 @@ fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let pretty = !args.iter().any(|arg| arg == "--compact");
     args.retain(|arg| arg != "--compact");
+    let mut scan_paths = Vec::new();
+    while let Some(index) = args.iter().position(|arg| arg == "--scan-path") {
+        if index + 1 >= args.len() || args[index + 1].starts_with('-') {
+            return emit_failure(&commands::Failure {
+                exit: 64, code: "missing_scan_path", message: "--scan-path 需要缓存目录".into(), hint: None,
+            }, pretty);
+        }
+        scan_paths.push(args.remove(index + 1));
+        args.remove(index);
+    }
+    let _ = commands::SCAN_PATHS.set(scan_paths);
     let Some(command) = args.first().cloned() else {
         eprintln!("usage: wxlocated <command>");
         return ExitCode::from(64);

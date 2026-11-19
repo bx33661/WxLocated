@@ -49,10 +49,11 @@ impl From<std::io::Error> for MaterialExportError {
 }
 
 pub fn folder_name(app: &Miniapp) -> String {
-    match &app.version {
+    let name = match &app.version {
         Some(version) => format!("{}-v{version}", app.app_id),
         None => app.app_id.clone(),
-    }
+    };
+    if cfg!(windows) { crate::platform::safe_file_name(&name) } else { name }
 }
 
 /// Returns the `ExportResult` document.
@@ -334,25 +335,46 @@ fn reusable_export(destination: &Path, app: &Miniapp, context: &Context, options
 
 /// Rewrites the JSON manifests so they carry no home directory or account id.
 fn redact_paths(root: &Path, account_directory: Option<&str>) -> std::io::Result<()> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut replacements = vec![(home.clone(), "~".to_string()), (home.replace('/', "\\/"), "~".to_string())];
-    if let Some(account) = account_directory.filter(|a| !a.is_empty()) {
-        replacements.push((account.to_string(), "<account>".to_string()));
-    }
+    let home = crate::platform::home_dir().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
     for path in walk_files(root) {
         let name = file_name(&path);
         if name != "material.json" && name != "WxLocated-decompilation.json" {
             continue;
         }
-        let Ok(mut text) = std::fs::read_to_string(&path) else { continue };
-        for (needle, replacement) in &replacements {
-            if !needle.is_empty() {
-                text = text.replace(needle, replacement);
-            }
-        }
-        std::fs::write(&path, text)?;
+        let text = std::fs::read_to_string(&path)?;
+        let mut value: Value = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+        redact_value(&mut value, &home, account_directory);
+        std::fs::write(&path, encode(&value, true))?;
     }
     Ok(())
+}
+
+// Work on decoded JSON strings so escaped backslashes are treated as paths.
+fn redact_value(value: &mut Value, home: &str, account: Option<&str>) {
+    let home_pattern = if home.is_empty() { None } else {
+        let native = home.replace('/', "\\");
+        let forward = home.replace('\\', "/");
+        let candidates = [format!(r"\\?\{native}"), format!("//?/{forward}"), home.to_string(), native, forward];
+        let pattern = candidates.iter().map(|path| regex::escape(path)).collect::<Vec<_>>().join("|");
+        Some(regex::RegexBuilder::new(&pattern).case_insensitive(cfg!(windows)).build().expect("escaped home path regex"))
+    };
+    redact_strings(value, home_pattern.as_ref(), account);
+}
+
+fn redact_strings(value: &mut Value, home: Option<&regex::Regex>, account: Option<&str>) {
+    match value {
+        Value::String(text) => {
+            if let Some(home) = home {
+                *text = home.replace_all(text, "~").into_owned();
+            }
+            if let Some(account) = account.filter(|account| !account.is_empty()) {
+                *text = text.replace(account, "<account>");
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| redact_strings(item, home, account)),
+        Value::Object(items) => items.values_mut().for_each(|item| redact_strings(item, home, account)),
+        _ => {}
+    }
 }
 
 fn walk_files(root: &Path) -> Vec<PathBuf> {
@@ -386,7 +408,9 @@ fn copy_directory(source: &Path, target: &Path) -> std::io::Result<()> {
 
 fn safe_folder_name(value: &str) -> String {
     let cleaned: String = value.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
-    if cleaned.is_empty() || cleaned.starts_with('.') { "plugin".into() } else { cleaned }
+    if cleaned.is_empty() || cleaned.starts_with('.') { "plugin".into() }
+    else if cfg!(windows) { crate::platform::safe_file_name(&cleaned) }
+    else { cleaned }
 }
 
 fn file_name(path: &Path) -> String {
@@ -480,6 +504,24 @@ pub fn agent_readme(report: &Value, has_raw: bool, has_source: bool) -> String {
 mod tests {
     use super::*;
     use crate::scan::Generation;
+
+    #[test]
+    fn redacts_decoded_windows_paths_and_keeps_valid_json() {
+        let mut value = json!({
+            "package": r"C:\Users\测试 user\WeChat Files\account-id\a.wxapkg",
+            "nested": [{"source": "C:/Users/测试 user/WeChat Files/account-id/a.wxapkg"}],
+            "canonical": r"\\?\C:\Users\测试 user\a.wxapkg",
+            "size": 42
+        });
+        redact_value(&mut value, r"C:\Users\测试 user", Some("account-id"));
+        let encoded = encode(&value, true);
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded["package"], r"~\WeChat Files\<account>\a.wxapkg");
+        assert_eq!(decoded["nested"][0]["source"], "~/WeChat Files/<account>/a.wxapkg");
+        assert_eq!(decoded["canonical"], r"~\a.wxapkg");
+        assert_eq!(decoded["size"], 42);
+        assert!(!encoded.contains("测试 user"));
+    }
 
     #[test]
     fn reuse_tracks_declared_plugins_and_rejects_obsolete_status_revision() {

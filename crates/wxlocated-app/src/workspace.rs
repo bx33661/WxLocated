@@ -239,7 +239,7 @@ pub fn open_overlay_folder(work: PathBuf, cx: &mut App) {
 impl Workspace {
     fn new(app: Miniapp, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tree = cx.new(|cx| TreeState::new(cx));
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("筛选文件  ⇧⌘O"));
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(ui::shortcut("筛选文件  ⇧⌘O")));
         let subscriptions = vec![
             cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -896,7 +896,7 @@ impl Workspace {
                     .accessibility_label("返回画廊")
                     .ghost()
                     .small()
-                    .tooltip("返回画廊（⌘[）")
+                    .tooltip(ui::shortcut("返回画廊（⌘[）"))
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(BackToGallery), cx)),
             )
             .child(div().w(px(1.)).h(px(20.)).bg(palette.hairline))
@@ -937,11 +937,11 @@ impl Workspace {
                     .icon(IconName::Download)
                     .label("导出")
                     .small()
-                    .tooltip("导出审计材料、当前文件或源码工程（审计材料 ⌘E）")
+                    .tooltip(ui::shortcut("导出审计材料、当前文件或源码工程（审计材料 ⌘E）"))
                     .disabled(!ready)
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                         let (a, b) = (export_weak.clone(), export_weak.clone());
-                        menu.item(PopupMenuItem::new("导出审计材料…  ⌘E").icon(IconName::PackageCheck).on_click(|_, window, cx| {
+                        menu.item(PopupMenuItem::new(ui::shortcut("导出审计材料…  ⌘E")).icon(IconName::PackageCheck).on_click(|_, window, cx| {
                             window.dispatch_action(Box::new(ExportMaterial), cx)
                         }))
                         .separator()
@@ -960,7 +960,7 @@ impl Workspace {
                     .ghost()
                     .small()
                     .selected(self.show_inspector)
-                    .tooltip("显示或隐藏检查器（⌥⌘0）")
+                    .tooltip(ui::shortcut("显示或隐藏检查器（⌥⌘0）"))
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleInspector), cx)),
             ),
         )
@@ -1033,7 +1033,7 @@ impl Workspace {
                             .child(IconName::LayoutDashboard)
                             .child("概要")
                             .child(div().flex_1())
-                            .child(div().text_size(px(10.5)).text_color(palette.tertiary).child("⌘0"))
+                            .child(div().text_size(px(10.5)).text_color(palette.tertiary).child(ui::shortcut("⌘0")))
                             .on_click(cx.listener(|this, _, window, cx| this.select(None, window, cx))),
                     )
                     .child(
@@ -1183,7 +1183,7 @@ impl Workspace {
                     .label("概要")
                     .ghost()
                     .xsmall()
-                    .tooltip("回到概要（⌘0）")
+                    .tooltip(ui::shortcut("回到概要（⌘0）"))
                     .on_click(cx.listener(|this, _, window, cx| this.select(None, window, cx))),
             )
             .child(div().w(px(1.)).h(px(14.)).bg(palette.hairline))
@@ -1283,7 +1283,7 @@ impl Workspace {
                     .text_color(palette.secondary)
                     .child(div().text_color(palette.accent).child(IconName::ScanSearch))
                     .child(div().flex_1().child("包内原始字节；高亮处是这个文件的来源区间。引用证据时以这里为准。"))
-                    .child(div().text_color(palette.tertiary).child("⌥⌘R 切回重建")),
+                    .child(div().text_color(palette.tertiary).child(ui::shortcut("⌥⌘R 切回重建"))),
             ),
             View::Rebuilt => None,
         };
@@ -1787,10 +1787,10 @@ impl Workspace {
                 Content::Entry(entry) => loaded.set.entries[*entry].size as i64,
             };
             let (color, explanation) = match artifact.confidence {
-                Confidence::Exact => (palette.success, "与包内字节或 Source Map 原文一致。"),
-                Confidence::High => (palette.accent, "按编译结构确定性还原，语义应与原文一致。"),
-                Confidence::Medium => (palette.warning, "部分结构为推导结果，引用前请对照原始文件（⌥⌘R）。"),
-                Confidence::Low => (palette.warning, "只能部分还原，保留了原始片段与诊断，请以原始文件为准（⌥⌘R）。"),
+                Confidence::Exact => (palette.success, "与包内字节或 Source Map 原文一致。".to_string()),
+                Confidence::High => (palette.accent, "按编译结构确定性还原，语义应与原文一致。".to_string()),
+                Confidence::Medium => (palette.warning, ui::shortcut("部分结构为推导结果，引用前请对照原始文件（⌥⌘R）。")),
+                Confidence::Low => (palette.warning, ui::shortcut("只能部分还原，保留了原始片段与诊断，请以原始文件为准（⌥⌘R）。")),
             };
             let path = artifact.path.clone();
             sections.push(
@@ -1859,7 +1859,7 @@ impl Workspace {
                     h_flex()
                         .pt_1()
                         .gap_1p5()
-                        .child(Button::new("app-reveal").icon(IconName::FolderOpen).label("Finder").xsmall().on_click(move |_, _, cx| cx.reveal_path(&folder)))
+                        .child(Button::new("app-reveal").icon(IconName::FolderOpen).label(wxlocated_engine::platform::file_manager_name()).xsmall().on_click(move |_, _, cx| cx.reveal_path(&folder)))
                         .child(Button::new("app-copy").icon(IconName::Copy).label("复制路径").xsmall().on_click(move |_, _, cx| ui::copy(folder_copy.clone(), cx))),
                 )
                 .into_any_element(),
@@ -2297,10 +2297,10 @@ fn build_tree(paths: &[&str], expanded: bool) -> Vec<TreeItem> {
     items(&root, "", expanded)
 }
 
-#[cfg(feature = "snapshot")]
+#[cfg(all(feature = "snapshot", target_os = "macos"))]
 pub const SNAPSHOT_STEPS: &[&str] = &["file", "raw", "image", "overview"];
 
-#[cfg(feature = "snapshot")]
+#[cfg(all(feature = "snapshot", target_os = "macos"))]
 pub fn snapshot_ready(handle: AnyWindowHandle, cx: &mut AsyncApp) -> bool {
     cx.update(|cx| {
         handle
@@ -2311,7 +2311,7 @@ pub fn snapshot_ready(handle: AnyWindowHandle, cx: &mut AsyncApp) -> bool {
     })
 }
 
-#[cfg(feature = "snapshot")]
+#[cfg(all(feature = "snapshot", target_os = "macos"))]
 pub fn snapshot_step(handle: AnyWindowHandle, step: &str, cx: &mut AsyncApp) {
     let step = step.to_string();
     cx.update(|cx| {

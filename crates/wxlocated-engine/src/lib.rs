@@ -9,6 +9,7 @@ pub mod js;
 pub mod json;
 pub mod material;
 pub mod overlay;
+pub mod platform;
 pub mod scan;
 pub mod settings;
 pub mod swift_json;
