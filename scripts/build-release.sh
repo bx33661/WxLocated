@@ -29,7 +29,11 @@ mkdir -p "$STAGE"
 OUTPUT_DIR="$STAGE" SIGN_IDENTITY="${DEVELOPER_ID_APPLICATION:--}" "$ROOT/scripts/bundle-macos.sh"
 
 for executable in "$APP/Contents/MacOS/WxLocated" "$APP/Contents/Helpers/wxlocated"; do
-  lipo -verify_arch arm64 x86_64 "$executable"
+  architectures="$(lipo -archs "$executable")"
+  if [[ "$architectures" != "x86_64 arm64" && "$architectures" != "arm64 x86_64" ]]; then
+    echo "Expected arm64 and x86_64 in $executable, found: $architectures" >&2
+    exit 3
+  fi
 done
 for arch in arm64 x86_64; do
   output="$(/usr/bin/arch -"$arch" "$APP/Contents/Helpers/wxlocated" --version)"
