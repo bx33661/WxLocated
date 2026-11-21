@@ -27,9 +27,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Build and verify macOS app bundle
+        if: runner.os == 'macOS'
+        shell: zsh {0}
+        run: |
+          arch="$(uname -m | sed 's/^arm64$/aarch64/')"
+          ARCHS="$arch" ./scripts/bundle-macos.sh
+          test -f target/bundle/WxLocated.app/Contents/MacOS/WxLocated
+          test -f target/bundle/WxLocated.app/Contents/Helpers/wxlocated
+          test -f target/bundle/WxLocated.app/Contents/Resources/AppIcon.icns
+          codesign --verify --deep --strict target/bundle/WxLocated.app
+          python3 scripts/smoke-cli.py --cli target/bundle/WxLocated.app/Contents/Helpers/wxlocated
       - name: Build and verify Windows release package
         id: windows-bundle
         if: runner.os == 'Windows'

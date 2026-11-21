@@ -184,18 +184,121 @@ fn scan_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
     bytes.len()
 }
 
+const MAXIMUM_TEMPLATE_DEPTH: usize = 128;
+
 fn scan_template(bytes: &[u8], start: usize) -> usize {
+    scan_template_inner(bytes, start, 0)
+}
+
+fn scan_template_inner(bytes: &[u8], start: usize, depth: usize) -> usize {
     let mut index = start + 1;
     while index < bytes.len() {
         if bytes[index] == b'\\' {
             index = bytes.len().min(index + 2);
         } else if bytes[index] == b'`' {
             return index + 1;
+        } else if bytes[index] == b'$'
+            && index + 1 < bytes.len()
+            && bytes[index + 1] == b'{'
+            && depth < MAXIMUM_TEMPLATE_DEPTH
+        {
+            index = scan_template_expression(bytes, index + 2, depth + 1);
         } else {
             index += 1;
         }
     }
     bytes.len()
+}
+
+fn scan_template_expression(bytes: &[u8], mut index: usize, depth: usize) -> usize {
+    let mut brace_depth = 1usize;
+    let mut expects_regex = true;
+    while index < bytes.len() && brace_depth > 0 {
+        let byte = bytes[index];
+        if is_whitespace(byte) {
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            index = scan_quoted(bytes, index, byte);
+            expects_regex = false;
+            continue;
+        }
+        if byte == b'`' {
+            index = scan_template_inner(bytes, index, depth);
+            expects_regex = false;
+            continue;
+        }
+        if byte == b'/' && index + 1 < bytes.len() {
+            if bytes[index + 1] == b'/' {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            if bytes[index + 1] == b'*' {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                    index += 1;
+                }
+                index = bytes.len().min(index + 2);
+                continue;
+            }
+            if expects_regex {
+                let end = scan_regex(bytes, index);
+                if end > index + 1 {
+                    index = end;
+                    expects_regex = false;
+                    continue;
+                }
+            }
+        }
+        if is_identifier_start(byte) {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && is_identifier_continuation(bytes[index]) {
+                index += 1;
+            }
+            let name = &bytes[start..index];
+            expects_regex = matches!(
+                name,
+                b"return"
+                    | b"throw"
+                    | b"case"
+                    | b"delete"
+                    | b"void"
+                    | b"typeof"
+                    | b"instanceof"
+                    | b"in"
+                    | b"of"
+                    | b"yield"
+                    | b"await"
+            );
+            continue;
+        }
+        if is_digit(byte) || (byte == b'.' && index + 1 < bytes.len() && is_digit(bytes[index + 1])) {
+            index += 1;
+            while index < bytes.len()
+                && (is_digit(bytes[index]) || is_identifier_continuation(bytes[index]) || bytes[index] == b'.')
+            {
+                index += 1;
+            }
+            expects_regex = false;
+            continue;
+        }
+        if byte == b'{' {
+            brace_depth += 1;
+            expects_regex = true;
+        } else if byte == b'}' {
+            brace_depth -= 1;
+            expects_regex = false;
+        } else {
+            expects_regex = !matches!(byte, b')' | b']');
+        }
+        index += 1;
+    }
+    index
 }
 
 fn scan_regex(bytes: &[u8], start: usize) -> usize {
@@ -243,28 +346,93 @@ fn expects_expression(token: Option<&Token>) -> bool {
 
 fn decode_string_literal(raw: &str) -> String {
     let mut output = String::with_capacity(raw.len());
-    let mut characters = raw.chars();
-    while let Some(character) = characters.next() {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        let character = raw[i..].chars().next().expect("valid utf8");
         if character != '\\' {
             output.push(character);
+            i += character.len_utf8();
             continue;
         }
-        let Some(escaped) = characters.next() else {
-            output.push(character);
-            continue;
-        };
+        i += 1;
+        if i >= raw.len() {
+            output.push('\\');
+            break;
+        }
+        let escaped = raw[i..].chars().next().expect("valid utf8");
+        i += escaped.len_utf8();
         match escaped {
             'n' => output.push('\n'),
             'r' => output.push('\r'),
+            '\r' => {
+                if bytes.get(i) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            '\n' => {}
             't' => output.push('\t'),
             'b' => output.push('\u{8}'),
             'f' => output.push('\u{c}'),
             'v' => output.push('\u{b}'),
             '0' => output.push('\0'),
+            'x' => {
+                if let Some(hex) = parse_hex_bytes(bytes.get(i..i + 2))
+                    && let Ok(value) = u8::try_from(hex)
+                {
+                    output.push(char::from(value));
+                    i += 2;
+                } else {
+                    output.push('x');
+                }
+            }
+            'u' => {
+                if bytes.get(i) == Some(&b'{') {
+                    if let Some(rel_close) = bytes[i + 1..].iter().position(|&b| b == b'}')
+                        && rel_close > 0
+                        && let Some(code) = parse_hex_bytes(Some(&bytes[i + 1..i + 1 + rel_close]))
+                        && let Some(decoded) = char::from_u32(code)
+                    {
+                        output.push(decoded);
+                        i += 1 + rel_close + 1;
+                    } else {
+                        output.push('u');
+                    }
+                } else if let Some(code) = parse_hex_bytes(bytes.get(i..i + 4)) {
+                    i += 4;
+                    if (0xD800..=0xDBFF).contains(&code) {
+                        if bytes.get(i..i + 2) == Some(b"\\u")
+                            && let Some(low) = parse_hex_bytes(bytes.get(i + 2..i + 6))
+                            && (0xDC00..=0xDFFF).contains(&low)
+                        {
+                            let scalar = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                            output.push(char::from_u32(scalar).unwrap_or(char::REPLACEMENT_CHARACTER));
+                            i += 6;
+                        } else {
+                            output.push(char::REPLACEMENT_CHARACTER);
+                        }
+                    } else if (0xDC00..=0xDFFF).contains(&code) {
+                        output.push(char::REPLACEMENT_CHARACTER);
+                    } else {
+                        output.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+                    }
+                } else {
+                    output.push('u');
+                }
+            }
             other => output.push(other),
         }
     }
     output
+}
+
+fn parse_hex_bytes(slice: Option<&[u8]>) -> Option<u32> {
+    let slice = slice?;
+    if slice.is_empty() || !slice.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let text = std::str::from_utf8(slice).ok()?;
+    u32::from_str_radix(text, 16).ok()
 }
 
 fn is_whitespace(byte: u8) -> bool {
@@ -312,5 +480,28 @@ mod tests {
         let tokens = tokenize(source.as_bytes());
         assert_eq!(tokens[2].kind, Kind::String("中文".into()));
         assert_eq!(tokens[4].start, source.find('y').unwrap());
+    }
+
+    #[test]
+    fn decodes_unicode_hex_surrogates_and_line_continuations() {
+        assert_eq!(decode_string_literal(r"\u4e2d\u6587"), "中文");
+        assert_eq!(decode_string_literal(r"\x41\x62"), "Ab");
+        assert_eq!(decode_string_literal(r"\u{1F600}"), "😀");
+        assert_eq!(decode_string_literal(r"\uD83D\uDE00"), "😀");
+        assert_eq!(decode_string_literal("a\\\nb\\\r\nc\\\rd"), "abcd");
+        assert_eq!(decode_string_literal(r"x\r\ny"), "x\r\ny");
+        assert_eq!(decode_string_literal(r"\xZZ"), "xZZ");
+        assert_eq!(decode_string_literal(r"\u12"), "u12");
+        assert_eq!(decode_string_literal(r"\uD800"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn scans_nested_template_expressions() {
+        let source = r#"const s = `a ${`b ${"}"} c`} d`; next"#;
+        let tokens = tokenize(source.as_bytes());
+        assert_eq!(tokens[3].kind, Kind::Template);
+        assert_eq!(&source[tokens[3].start..tokens[3].end], r#"`a ${`b ${"}"} c`} d`"#);
+        assert!(tokens[4].is_punctuator(b';'));
+        assert_eq!(tokens[5].identifier(), Some("next"));
     }
 }

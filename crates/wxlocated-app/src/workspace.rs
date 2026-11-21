@@ -117,16 +117,8 @@ pub fn open_app_window(app_id: &str, cx: &mut App) {
         cx.new(|cx| Workspace::new(app, window, cx))
     }) {
         library.update(cx, |library, _| {
-            library.app_windows.insert(id.clone(), handle);
+            library.app_windows.insert(id, handle);
         });
-        cx.on_window_closed(move |cx, closed| {
-            if closed == handle.window_id() {
-                Library::global(cx).update(cx, |library, _| {
-                    library.app_windows.remove(&id);
-                });
-            }
-        })
-        .detach();
     }
 }
 
@@ -259,6 +251,7 @@ impl Workspace {
         let app = self.app.clone();
         let context = self.context(cx);
         let path = self.packages.get(self.package).and_then(|p| p.path.clone());
+        let is_full_app = path.is_none();
         let (progress, steps) = async_channel::unbounded::<usize>();
         cx.spawn(async move |this, cx| {
             while let Ok(step) = steps.recv().await {
@@ -312,8 +305,10 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 this.phase = match outcome {
                     Ok(loaded) => {
-                        let id = this.app.app_id.clone();
-                        Library::global(cx).update(cx, |library, cx| library.record_rebuild(&id, loaded.summary, cx));
+                        if is_full_app {
+                            let id = this.app.app_id.clone();
+                            Library::global(cx).update(cx, |library, cx| library.record_rebuild(&id, loaded.summary, cx));
+                        }
                         Phase::Ready(Arc::new(loaded))
                     }
                     Err(message) => Phase::Failed(message),

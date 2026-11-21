@@ -378,7 +378,7 @@ pub(super) fn build_evidence(loaded: &Loaded, index: usize, view: View, reading:
     let archive = &loaded.set.sources[entry.source].archive;
     let inspection = loaded.inspections.iter().find(|inspection| inspection.path == archive.path).ok_or("没有原始包指纹，请重新重建")?;
     let sha256 = inspection.sha256.as_deref().ok_or("原始包 SHA-256 不可用")?;
-    if verify && report::inspect_package(&archive.path, wxlocated_engine::archive::inferred_app_id(&archive.path).as_deref()).sha256.as_deref() != Some(sha256) {
+    if verify && wxlocated_engine::sha256_file(&archive.path).ok().map(|(hash, _)| hash).as_deref() != Some(sha256) {
         return Err("原始缓存包已变化，无法引用旧指纹。请重新重建后再复制证据。".into());
     }
     let identical = view == View::Raw || (view == View::Rebuilt && matches!(artifact.content, Content::Entry(_)));

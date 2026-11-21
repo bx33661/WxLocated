@@ -72,6 +72,7 @@ pub fn list(scan_paths: &[String]) -> Value {
 }
 
 /// A command failure: printed as `{schema_version, error}` with this exit code.
+#[derive(Debug)]
 pub struct Failure {
     pub exit: u8,
     pub code: &'static str,
@@ -189,4 +190,67 @@ pub fn trace(args: &[String]) -> Result<Value, Failure> {
 
 pub fn version() -> Value {
     json!({ "schema_version": SCHEMA_VERSION, "name": "wxlocated", "version": TOOL_VERSION })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    use super::*;
+
+    fn miniapp(app_id: &str, name: Option<&str>) -> Miniapp {
+        Miniapp {
+            app_id: app_id.into(),
+            name: name.map(str::to_string),
+            main_package: PathBuf::from(format!("/cache/{app_id}/1/__APP__.wxapkg")),
+            sub_packages: Vec::new(),
+            size: 128,
+            modified: SystemTime::UNIX_EPOCH,
+            version: Some("1".into()),
+            icon: None,
+            metadata_source: None,
+            declared_subpackage_roots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn option_and_positional_helpers_skip_valued_flags() {
+        let args: Vec<String> = ["--out", "/tmp/out", "wx0123456789abcdef", "--reuse"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(option_value(&args, &["--out", "-o"]), Some("/tmp/out"));
+        let pos: Vec<_> = positionals(&args, &["--out", "-o"]).collect();
+        assert_eq!(pos, ["wx0123456789abcdef"]);
+    }
+
+    #[test]
+    fn resolve_app_handles_id_unique_name_ambiguity_and_access_hint() {
+        let mut snapshot = Snapshot {
+            miniapps: vec![
+                miniapp("wx1111111111111111", Some("重复名称")),
+                miniapp("wx2222222222222222", Some("重复名称")),
+                miniapp("wx3333333333333333", Some("唯一名称")),
+            ],
+            ..Snapshot::default()
+        };
+
+        assert_eq!(resolve_app(&snapshot, "wx1111111111111111").unwrap().app_id, "wx1111111111111111");
+        assert_eq!(resolve_app(&snapshot, "唯一名称").unwrap().app_id, "wx3333333333333333");
+
+        let amb = resolve_app(&snapshot, "重复名称").unwrap_err();
+        assert_eq!(amb.exit, EXIT_USAGE);
+        assert_eq!(amb.code, "ambiguous");
+
+        let missing = resolve_app(&snapshot, "不存在").unwrap_err();
+        assert_eq!(missing.exit, EXIT_NOT_FOUND);
+        assert_eq!(missing.code, "not_found");
+        assert!(missing.hint.as_deref().is_some_and(|h| h.contains("wxlocated list")));
+
+        snapshot.inaccessible_roots.push(PathBuf::from("/blocked"));
+        let blocked = resolve_app(&snapshot, "不存在").unwrap_err();
+        assert_eq!(blocked.exit, EXIT_NOT_FOUND);
+        assert_eq!(blocked.hint.as_deref(), Some(ACCESS_HINT));
+    }
 }

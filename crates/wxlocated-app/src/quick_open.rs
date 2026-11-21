@@ -71,10 +71,9 @@ impl QuickOpen {
         let text = self.query.read(cx).value().trim().to_lowercase();
         let recent = &library.settings.recent_app_ids;
         let mut apps: Vec<Miniapp> = library
-            .apps()
-            .iter()
+            .all_apps()
+            .into_iter()
             .filter(|a| text.is_empty() || a.display_name().to_lowercase().contains(&text) || a.app_id.to_lowercase().contains(&text))
-            .cloned()
             .collect();
         apps.sort_by_key(|a| (recent.iter().position(|id| *id == a.app_id).unwrap_or(usize::MAX), std::cmp::Reverse(a.modified)));
         apps

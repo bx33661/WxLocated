@@ -335,10 +335,7 @@ pub fn import(
         }
         manifest.files = kept;
         write_manifest(&staging, &manifest)?;
-        if destination.exists() {
-            std::fs::remove_dir_all(&destination)?;
-        }
-        std::fs::rename(&staging, &destination)?;
+        crate::export::replace_directory(&staging, &destination)?;
         Ok(())
     })();
     if result.is_err() {

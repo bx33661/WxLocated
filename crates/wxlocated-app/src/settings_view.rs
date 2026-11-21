@@ -299,9 +299,20 @@ impl SettingsView {
         let last_scan = library.last_scan;
         let gap = library.has_coverage_gap();
         let apps = snapshot.as_ref().map(|s| s.miniapps.len()).unwrap_or(0);
+        let has_inaccessible = snapshot.as_ref().is_some_and(|s| !s.inaccessible_roots.is_empty());
         let (title, description, color, icon) = match &snapshot {
             _ if scanning => ("正在重新核验目录", "正在遍历缓存并重新计算包、版本、插件与元数据指标。".to_string(), palette.accent, IconName::RefreshCw),
             None => ("等待首次扫描", "开始扫描后会记录目录状态和每类文件的处理结果。".to_string(), palette.secondary, IconName::Clock),
+            Some(s) if s.readable_roots.is_empty() && !s.inaccessible_roots.is_empty() => (
+                "缓存目录权限受限",
+                if cfg!(target_os = "macos") {
+                    format!("检测到 {} 个缓存目录无权读取。请在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许 WxLocated（如升级前已勾选旧版，请先点「-」移除再重新添加），然后重启应用。", s.inaccessible_roots.len())
+                } else {
+                    format!("检测到 {} 个缓存目录无权读取。请确认当前用户具有读取权限，或添加可读取的 Applet 缓存目录。", s.inaccessible_roots.len())
+                },
+                palette.warning,
+                IconName::TriangleAlert,
+            ),
             Some(s) if s.readable_roots.is_empty() => {
                 ("尚未发现可读取的缓存目录", "请选择包含 packages 与 icon 的 Applet 缓存目录后重新扫描。".to_string(), palette.warning, IconName::TriangleAlert)
             }
@@ -338,12 +349,21 @@ impl SettingsView {
                         }),
                 )
                 .child(
-                    Button::new("rescan")
-                        .icon(IconName::RefreshCw)
-                        .label("重新扫描")
-                        .small()
-                        .loading(scanning)
-                        .on_click(cx.listener(|this, _, _, cx| this.library.update(cx, |library, cx| library.refresh(cx)))),
+                    h_flex()
+                        .gap_2()
+                        .when(cfg!(target_os = "macos") && has_inaccessible, |this| {
+                            this.child(Button::new("scan-privacy").label("打开隐私设置").small().on_click(|_, _, cx| {
+                                cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                            }))
+                        })
+                        .child(
+                            Button::new("rescan")
+                                .icon(IconName::RefreshCw)
+                                .label("重新扫描")
+                                .small()
+                                .loading(scanning)
+                                .on_click(cx.listener(|this, _, _, cx| this.library.update(cx, |library, cx| library.refresh(cx)))),
+                        ),
                 )
                 .into_any_element(),
         ];
@@ -462,9 +482,13 @@ impl SettingsView {
     fn render_agent(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let palette = palette(cx);
         let binary = cli_binary();
-        let (path_label, status) = match cli::shim_path() {
-            Ok(path) => (display_path(&path.to_string_lossy()), platform::cli_status(&path, binary.as_deref())),
-            Err(error) => ("未确定".into(), Err(error)),
+        let (path_label, on_path, status) = match cli::shim_path() {
+            Ok(path) => (
+                display_path(&path.to_string_lossy()),
+                path.parent().is_some_and(platform::directory_on_path),
+                platform::cli_status(&path, binary.as_deref()),
+            ),
+            Err(error) => ("未确定".into(), false, Err(error)),
         };
         let cli_status = status.as_ref().ok().copied();
         let installed = cli_status == Some(CliStatus::Installed);
@@ -516,6 +540,17 @@ impl SettingsView {
         if binary.is_none() {
             cli_rows.push(
                 div().px(px(14.)).py_2().text_size(px(12.)).text_color(palette.warning).child("没有找到随 App 附带的 wxlocated（开发构建请先 cargo build -p wxlocated-cli）。").into_any_element(),
+            );
+        }
+        if !cfg!(windows) && installed && !on_path {
+            cli_rows.push(
+                div()
+                    .px(px(14.))
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(palette.warning)
+                    .child("~/.local/bin 不在当前 PATH 中，请在 shell 配置中加入 export PATH=\"$HOME/.local/bin:$PATH\" 后重新打开终端。")
+                    .into_any_element(),
             );
         }
 

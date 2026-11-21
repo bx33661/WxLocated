@@ -18,6 +18,7 @@ use crate::archive::Archive;
 use crate::material::report::SCHEMA_VERSION;
 use crate::overlay;
 
+#[derive(Debug)]
 pub struct TraceFailure {
     /// 64 usage, 66 not found, 70 failure.
     pub exit: u8,
@@ -32,18 +33,40 @@ fn fail(exit: u8, code: &'static str, message: String) -> TraceFailure {
 /// `root` is the material directory as given (already `~`-expanded and made
 /// absolute by the caller).
 pub fn trace(args: &[String], root: impl Fn(&str) -> PathBuf) -> Result<Value, TraceFailure> {
-    let positionals: Vec<&String> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
+    let mut positionals: Vec<&String> = Vec::new();
+    let mut context_bytes: i64 = 120;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--context" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| fail(64, "missing_arguments", "--context 需要非负整数字节数".into()))?;
+            context_bytes = value
+                .parse::<i64>()
+                .ok()
+                .filter(|&n| n >= 0)
+                .ok_or_else(|| fail(64, "missing_arguments", "--context 需要非负整数字节数".into()))?;
+            index += 2;
+        } else if let Some(value) = arg.strip_prefix("--context=") {
+            context_bytes = value
+                .parse::<i64>()
+                .ok()
+                .filter(|&n| n >= 0)
+                .ok_or_else(|| fail(64, "missing_arguments", "--context 需要非负整数字节数".into()))?;
+            index += 1;
+        } else if !arg.starts_with('-') {
+            positionals.push(arg);
+            index += 1;
+        } else {
+            index += 1;
+        }
+    }
     if positionals.len() < 2 {
         return Err(fail(64, "missing_arguments", "trace 需要 <材料目录> <路径>[:行号]".into()));
     }
     let root = root(positionals[0]);
     let (requested_path, line) = split_line(positionals[1]);
-    let context_bytes: i64 = args
-        .iter()
-        .position(|arg| arg == "--context")
-        .and_then(|index| args.get(index + 1))
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(120);
 
     let material: Value = std::fs::read_to_string(root.join("material.json"))
         .ok()
@@ -387,7 +410,7 @@ fn rebuilt_needle(source: &str, line: i64) -> Option<(String, usize)> {
     let mut compact = 0;
     let mut index = line as usize - 1;
     while index < lines.len() && parts.len() < 6 {
-        parts.push(&lines[index]);
+        parts.push(lines[index]);
         compact += lines[index].chars().filter(|c| !is_space_or_tab(*c)).count();
         if compact >= 12 {
             break;
@@ -416,6 +439,8 @@ fn trace_safe_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use serde_json::json;
     use super::locate_entry;
 
     #[test]
@@ -450,5 +475,77 @@ mod tests {
         assert_eq!(unchanged["start_offset"], 6);
         assert_eq!(unchanged["end_offset"], 12);
         assert_eq!(locate_entry(raw, "", None, 10..23, false, 120)["method"], "range");
+    }
+
+    #[test]
+    fn context_flag_works_before_and_after_positionals_and_rejects_invalid_values() {
+        let dir = std::env::temp_dir().join(format!("wxlocated-trace-test-{}", crate::export::uuid_string()));
+        std::fs::create_dir_all(dir.join("raw")).unwrap();
+        std::fs::create_dir_all(dir.join("source")).unwrap();
+
+        let content = b"console.log('hi');\n";
+        let name = b"app.js";
+        let index_size = 4 + 12 + name.len() as u32;
+        let mut pkg = vec![0xBE, 0, 0, 0, 0];
+        pkg.extend(index_size.to_be_bytes());
+        pkg.extend((content.len() as u32).to_be_bytes());
+        pkg.push(0xED);
+        pkg.extend(1u32.to_be_bytes());
+        pkg.extend((name.len() as u32).to_be_bytes());
+        pkg.extend(name);
+        pkg.extend((14 + index_size).to_be_bytes());
+        pkg.extend((content.len() as u32).to_be_bytes());
+        pkg.extend(content);
+        std::fs::write(dir.join("raw/__APP__.wxapkg"), pkg).unwrap();
+        std::fs::write(dir.join("source/app.js"), content).unwrap();
+        std::fs::write(
+            dir.join("material.json"),
+            serde_json::to_vec(&json!({
+                "metadata": { "app_id": "wx0123456789abcdef" },
+                "wxlocated": { "packages": [{ "file": "__APP__.wxapkg", "raw_path": "raw/__APP__.wxapkg" }] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("source/WxLocated-decompilation.json"),
+            serde_json::to_vec(&json!({
+                "artifacts": [{
+                    "path": "app.js",
+                    "confidence": "原样",
+                    "generated": false,
+                    "sources": [{ "package": "主包 · __APP__.wxapkg", "entryPath": "app.js" }]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let root_str = dir.to_string_lossy().into_owned();
+        let before = super::trace(
+            &["--context".into(), "12".into(), root_str.clone(), "app.js:1".into()],
+            |p| PathBuf::from(p),
+        )
+        .unwrap();
+        assert_eq!(before["match"]["method"], "identical");
+
+        let equals = super::trace(
+            &[root_str.clone(), "app.js:1".into(), "--context=12".into()],
+            |p| PathBuf::from(p),
+        )
+        .unwrap();
+        assert_eq!(equals["match"]["method"], "identical");
+
+        let missing = super::trace(&[root_str.clone(), "app.js:1".into(), "--context".into()], |p| PathBuf::from(p)).unwrap_err();
+        assert_eq!(missing.exit, 64);
+
+        let negative = super::trace(
+            &["--context".into(), "-5".into(), root_str, "app.js:1".into()],
+            |p| PathBuf::from(p),
+        )
+        .unwrap_err();
+        assert_eq!(negative.exit, 64);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -48,7 +48,13 @@ pub fn open_paths(paths: &[PathBuf], cx: &mut App) {
     }
     // Register the base app before routing layers from the same drop to it.
     if !packages.is_empty() {
-        let id = Library::global(cx).update(cx, |library, cx| library.open_external(&packages, cx));
+        let id = Library::global(cx).update(cx, |library, cx| {
+            let id = library.open_external(&packages, cx);
+            if let Some(id) = &id {
+                library.record_use(id, cx);
+            }
+            id
+        });
         if let Some(id) = id {
             crate::workspace::open_app_window(&id, cx);
         } else {

@@ -128,12 +128,12 @@ fn write_contents(result: &Decompilation, duration_seconds: f64, set: &PackageSe
     let mut input_packages = Vec::new();
     for source in &set.sources {
         let path = &source.archive.path;
-        let data = std::fs::read(path).map_err(|_| ExportError::SourceChanged)?;
+        let (sha256, size) = crate::sha256_file(path).map_err(|_| ExportError::SourceChanged)?;
         input_packages.push(json!({
             "path": path.to_string_lossy(),
             "format": source.archive.format.as_str(),
-            "size": data.len(),
-            "sha256": crate::sha256_hex(&data),
+            "size": size,
+            "sha256": sha256,
         }));
     }
     let count = |confidence: Confidence| result.artifacts.iter().filter(|a| a.confidence == confidence).count();
@@ -224,4 +224,50 @@ fn unique_destination(parent: &Path, preferred: &str) -> PathBuf {
         suffix += 1;
     }
     destination
+}
+
+/// Moves `staging` onto `destination`, keeping a backup until the replacement
+/// succeeds so an existing directory is not lost if the rename fails.
+pub(crate) fn replace_directory(staging: &Path, destination: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(destination).is_err() {
+        return std::fs::rename(staging, destination);
+    }
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let backup = parent.join(format!(".wxlocated-backup-{}", uuid_string()));
+    std::fs::rename(destination, &backup)?;
+    if let Err(error) = std::fs::rename(staging, destination) {
+        let _ = std::fs::rename(&backup, destination);
+        return Err(error);
+    }
+    let _ = std::fs::remove_dir_all(&backup);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_directory_swaps_atomically_and_removes_backup() -> std::io::Result<()> {
+        let root = std::env::temp_dir().join(format!("wxlocated-replace-{}", uuid_string()));
+        std::fs::create_dir_all(&root)?;
+        let destination = root.join("dest");
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&destination)?;
+        std::fs::create_dir_all(&staging)?;
+        std::fs::write(destination.join("old.txt"), b"old")?;
+        std::fs::write(staging.join("new.txt"), b"new")?;
+
+        replace_directory(&staging, &destination)?;
+        assert!(!staging.exists());
+        assert!(!destination.join("old.txt").exists());
+        assert_eq!(std::fs::read(destination.join("new.txt"))?, b"new");
+        let leftovers: Vec<_> = std::fs::read_dir(&root)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".wxlocated-backup-"))
+            .collect();
+        assert!(leftovers.is_empty());
+
+        std::fs::remove_dir_all(root)
+    }
 }

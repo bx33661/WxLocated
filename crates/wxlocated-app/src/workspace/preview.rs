@@ -504,7 +504,17 @@ fn prepare(loaded: &Loaded, index: usize, path: &str, view: View, compare: bool,
     if text.len() > LARGE_TEXT && !force {
         return Prepared::TooLarge(size);
     }
-    let evidence = build_evidence(loaded, index, view, &text, (!compare).then_some(1), false).ok();
+    let identical = view == View::Raw || (view == View::Rebuilt && matches!(artifact.content, Content::Entry(_)));
+    let raw_size = artifact
+        .sources
+        .first()
+        .and_then(|s| loaded.set.entries.iter().find(|e| e.path == s.entry_path && loaded.set.source_title(e) == s.package))
+        .map_or(0, |e| e.size);
+    let evidence = if identical || raw_size <= 512 * 1024 {
+        build_evidence(loaded, index, view, &text, (!compare).then_some(1), false).ok()
+    } else {
+        None
+    };
     let agent_diff = match (view, artifact.content.generated_text()) {
         (View::Agent(_), Some(base)) => Some(crate::diff::counts(base, &text)),
         _ => None,

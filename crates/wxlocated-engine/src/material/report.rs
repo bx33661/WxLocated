@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use serde_json::{Value, json};
 
 use super::{Completeness, Context, DeclaredPlugins};
-use crate::archive::{Archive, ArchiveError, PackageSet};
+use crate::archive::{Archive, ArchiveError, Format, PackageSet};
 use crate::decompile::{Confidence, Decompilation};
 use crate::json;
 use crate::scan::Miniapp;
@@ -19,7 +19,7 @@ use crate::swift_json::iso8601;
 pub const SCHEMA_VERSION: i64 = 2;
 /// Bump whenever restoration output or material status semantics change, so
 /// `--reuse` does not return an obsolete reconstruction or completeness report.
-pub const RECONSTRUCTION_REVISION: i64 = 11;
+pub const RECONSTRUCTION_REVISION: i64 = 12;
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // MARK: Content analysis
@@ -160,87 +160,47 @@ pub fn inspect_package(path: &Path, app_id: Option<&str>) -> Inspection {
     };
     let Ok(metadata) = std::fs::metadata(path) else { return unreadable(0, "文件已经不在缓存目录中") };
     let file_size = metadata.len() as i64;
-    let Ok(bytes) = std::fs::read(path) else { return unreadable(file_size, "文件读取失败，请检查目录权限") };
-    let sha256 = crate::sha256_hex(&bytes);
-    let (status, entry_count, notes) = inspect_structure(&bytes, path, app_id);
+    let Ok((sha256, _)) = crate::sha256_file(path) else { return unreadable(file_size, "文件读取失败，请检查目录权限") };
+    let (status, entry_count, notes) = inspect_structure(path, app_id);
     Inspection { path: path.to_path_buf(), file_size, sha256: Some(sha256), status, entry_count, notes }
 }
 
-fn inspect_structure(bytes: &[u8], path: &Path, app_id: Option<&str>) -> (Integrity, Option<i64>, Vec<String>) {
-    let damaged = |count: Option<i64>, note: &str| (Integrity::Damaged, count, vec![note.to_string()]);
-    let file_size = bytes.len() as u64;
-    if file_size < 14 {
-        return damaged(None, "文件长度小于 wxapkg 基础头部");
-    }
-    let header = &bytes[..14];
-    if !(header[0] == 0xBE && header[13] == 0xED) {
-        if header.starts_with(b"V1MMWX")
-            && let Some(app_id) = app_id
-            && let Ok(archive) = Archive::open_with_app_id(path, Some(app_id))
-        {
-            return (Integrity::Valid, Some(archive.entries.len() as i64), vec!["微信缓存加密层与解密后索引检查通过".into()]);
+fn inspect_structure(path: &Path, app_id: Option<&str>) -> (Integrity, Option<i64>, Vec<String>) {
+    match Archive::open_with_app_id(path, app_id) {
+        Ok(archive) => {
+            let entry_count = Some(archive.entries.len() as i64);
+            let needs_attention = archive
+                .notes
+                .iter()
+                .any(|note| note.contains("包内路径重复") || note.contains("包头声明的数据区大小与实际文件存在差异"));
+            if needs_attention {
+                return (Integrity::Attention, entry_count, archive.notes);
+            }
+            let message = match archive.format {
+                Format::Encrypted => "微信缓存加密层与解密后索引检查通过",
+                Format::Standard => "包头、索引与文件边界检查通过",
+            };
+            (Integrity::Valid, entry_count, vec![message.into()])
         }
-        return (Integrity::Unrecognized, None, vec!["未识别标准包头，可能是加密包或格式变体".into()]);
-    }
-    let be32 = |data: &[u8], at: usize| data.get(at..at + 4).map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap()));
-    let index_size = be32(header, 5) as usize;
-    if !(4..=8 * 1024 * 1024).contains(&index_size) || (14 + index_size) as u64 > file_size {
-        return damaged(None, "索引长度超出文件边界");
-    }
-    let index = &bytes[14..14 + index_size];
-    let file_count = be32(index, 0) as i64;
-    if file_count <= 0 || file_count >= 100_000 {
-        return damaged(Some(file_count), "索引文件数量异常");
-    }
-    let body_start = (14 + index_size) as u64;
-    let mut cursor = 4usize;
-    let mut names = BTreeSet::new();
-    let (mut duplicates, mut out_of_bounds) = (0, 0);
-    for _ in 0..file_count {
-        if cursor + 4 > index.len() {
-            return damaged(Some(file_count), "索引条目长度不完整");
+        Err(ArchiveError::Unreadable) => (Integrity::Unreadable, None, vec!["文件读取失败，请检查目录权限".into()]),
+        Err(ArchiveError::UnrecognizedFormat) => {
+            (Integrity::Unrecognized, None, vec!["未识别标准包头，可能是加密包或格式变体".into()])
         }
-        let name_length = be32(index, cursor) as usize;
-        cursor += 4;
-        if name_length == 0 || name_length >= 16_384 || cursor + name_length + 8 > index.len() {
-            return damaged(Some(file_count), "索引路径长度异常");
+        Err(error @ (ArchiveError::MissingAppId | ArchiveError::DecryptionFailed)) => {
+            (Integrity::Unrecognized, None, vec![error.to_string()])
         }
-        let Ok(name) = std::str::from_utf8(&index[cursor..cursor + name_length]) else {
-            return damaged(Some(file_count), "索引中存在非 UTF-8 路径");
-        };
-        cursor += name_length;
-        if !names.insert(name.replace('\\', "/").trim_matches('/').to_string()) {
-            duplicates += 1;
-        }
-        let offset = u64::from(be32(index, cursor));
-        cursor += 4;
-        let size = u64::from(be32(index, cursor));
-        cursor += 4;
-        if offset < body_start || offset > file_size || size > file_size - offset.min(file_size) {
-            out_of_bounds += 1;
-        }
+        Err(
+            error @ (ArchiveError::TruncatedHeader
+            | ArchiveError::InvalidIndexSize
+            | ArchiveError::InvalidFileCount
+            | ArchiveError::MalformedIndex
+            | ArchiveError::InvalidPath
+            | ArchiveError::EntryOutOfBounds(_)
+            | ArchiveError::EntryTooLarge(_)
+            | ArchiveError::PreviewTooLarge(_)
+            | ArchiveError::ReadFailed(_)),
+        ) => (Integrity::Damaged, None, vec![error.to_string()]),
     }
-    let mut notes = Vec::new();
-    if duplicates > 0 {
-        notes.push(format!("{duplicates} 个重复索引路径（读取时以最后一条为准）"));
-    }
-    if out_of_bounds > 0 {
-        notes.push(format!("{out_of_bounds} 个条目超出文件边界"));
-    }
-    let declared_body = u64::from(be32(header, 9));
-    let mismatch = declared_body != file_size - body_start;
-    if mismatch {
-        notes.push("头部声明大小与实际文件大小不一致".into());
-    }
-    if out_of_bounds > 0 {
-        return (Integrity::Damaged, Some(file_count), notes);
-    }
-    // Repeated names still resolve (to their last entry); worth reporting,
-    // not a reason to refuse the package.
-    if duplicates > 0 || mismatch {
-        return (Integrity::Attention, Some(file_count), notes);
-    }
-    (Integrity::Valid, Some(file_count), vec!["包头、索引与文件边界检查通过".into()])
 }
 
 // MARK: Report
@@ -668,5 +628,94 @@ mod tests {
         }
         inspections[0].status = Integrity::Valid;
         assert_eq!(report(&context, &inspections, Some("broken index".into()))["completeness"], "BLOCKED");
+    }
+
+    fn build_plain_wxapkg(entries: &[(&str, &[u8])], extra_tail: &[u8], out_of_bounds: bool) -> Vec<u8> {
+        let mut index = (entries.len() as u32).to_be_bytes().to_vec();
+        let index_size = 4 + entries.iter().map(|(name, _)| 12 + name.len()).sum::<usize>();
+        let mut offset = 14 + index_size as u32;
+        let mut body = Vec::new();
+        for (idx, (name, content)) in entries.iter().enumerate() {
+            index.extend((name.len() as u32).to_be_bytes());
+            index.extend(name.as_bytes());
+            let entry_len = if out_of_bounds && idx == 0 {
+                (content.len() as u32) + 4096
+            } else {
+                content.len() as u32
+            };
+            index.extend(offset.to_be_bytes());
+            index.extend(entry_len.to_be_bytes());
+            offset += content.len() as u32;
+            body.extend_from_slice(content);
+        }
+        let mut package = vec![0xBE, 0, 0, 0, 0];
+        package.extend((index_size as u32).to_be_bytes());
+        package.extend((body.len() as u32).to_be_bytes());
+        package.push(0xED);
+        package.extend(index);
+        package.extend(body);
+        package.extend_from_slice(extra_tail);
+        package
+    }
+
+    fn encrypt_v1mmwx(app_id: &str, plain: &[u8]) -> Vec<u8> {
+        use aes::Aes256;
+        use aes::cipher::{BlockCipherEncrypt, KeyInit};
+        assert!(plain.len() >= 1024);
+        let mut key = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(app_id.as_bytes(), b"saltiest", 1000, &mut key);
+        let cipher = Aes256::new((&key).into());
+        let mut head = plain[..1024].to_vec();
+        let mut previous = *b"the iv: 16 bytes";
+        for chunk in head.as_chunks_mut::<16>().0 {
+            for (byte, mask) in chunk.iter_mut().zip(previous) {
+                *byte ^= mask;
+            }
+            cipher.encrypt_block(chunk.into());
+            previous.copy_from_slice(chunk);
+        }
+        let bytes = app_id.as_bytes();
+        let xor_key = bytes[bytes.len() - 2];
+        let mut encrypted = Vec::with_capacity(6 + 1024 + plain.len() - 1023);
+        encrypted.extend_from_slice(b"V1MMWX");
+        encrypted.extend_from_slice(&head);
+        for &byte in &plain[1023..] {
+            encrypted.push(byte ^ xor_key);
+        }
+        encrypted
+    }
+
+    #[test]
+    fn encrypted_packages_report_attention_and_damaged_accurately() {
+        let dir = std::env::temp_dir().join(format!("wxlocated-report-{}", crate::export::uuid_string()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app_id = "wx0123456789abcdef";
+
+        // Valid encrypted package (padded body declared cleanly).
+        let big_body = vec![b'a'; 1024];
+        let valid_plain = build_plain_wxapkg(&[("app.js", &big_body)], &[], false);
+        let valid_path = dir.join("valid.wxapkg");
+        std::fs::write(&valid_path, encrypt_v1mmwx(app_id, &valid_plain)).unwrap();
+        let valid = inspect_package(&valid_path, Some(app_id));
+        assert_eq!(valid.status, Integrity::Valid);
+        assert_eq!(valid.entry_count, Some(1));
+
+        // Encrypted package with duplicate entry and body size mismatch -> Attention.
+        let dup_plain = build_plain_wxapkg(&[("app.js", b"one"), ("app.js", &big_body)], b"extra", false);
+        let dup_path = dir.join("dup.wxapkg");
+        std::fs::write(&dup_path, encrypt_v1mmwx(app_id, &dup_plain)).unwrap();
+        let dup = inspect_package(&dup_path, Some(app_id));
+        assert_eq!(dup.status, Integrity::Attention);
+        assert_eq!(dup.entry_count, Some(1));
+        assert!(dup.notes.iter().any(|n| n.contains("包内路径重复")));
+
+        // Encrypted package whose decrypted index entry goes out of bounds -> Damaged.
+        let damaged_plain = build_plain_wxapkg(&[("app.js", &big_body)], &[], true);
+        let damaged_path = dir.join("damaged.wxapkg");
+        std::fs::write(&damaged_path, encrypt_v1mmwx(app_id, &damaged_plain)).unwrap();
+        let damaged = inspect_package(&damaged_path, Some(app_id));
+        assert_eq!(damaged.status, Integrity::Damaged);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

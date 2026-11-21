@@ -240,10 +240,7 @@ fn build_into(
     }
     std::fs::write(staging.join("AGENT.md"), agent_readme(&report, options.include_raw, source_directory.is_some()))?;
 
-    if destination.exists() {
-        std::fs::remove_dir_all(destination)?;
-    }
-    std::fs::rename(staging, destination)?;
+    crate::export::replace_directory(staging, destination)?;
     log(&format!("完成：{}", destination.to_string_lossy()));
 
     let mut result = json!({
@@ -561,7 +558,7 @@ mod tests {
         assert!(reusable_export(&root, &app, &context, &options).is_some());
         context.plugins.remove("wx-provider");
         assert!(reusable_export(&root, &app, &context, &options).is_none());
-        manifest["wxlocated"]["reconstruction_revision"] = json!(10);
+        manifest["wxlocated"]["reconstruction_revision"] = json!(report::RECONSTRUCTION_REVISION - 1);
         manifest["wxlocated"]["plugins"][0]["packages"] = json!([]);
         save(&manifest);
         assert!(reusable_export(&root, &app, &context, &options).is_none());

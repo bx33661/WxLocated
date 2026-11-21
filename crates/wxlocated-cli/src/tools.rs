@@ -192,11 +192,29 @@ fn with_version(mut value: Value, version: &Option<String>) -> Value {
 pub fn watch(args: &[String], scan_paths: &[String]) -> Result<u8, Failure> {
     let query = app_query(args, "watch", &["--timeout", "--interval"])?;
     let duration = |flag, default: f64, minimum: f64| {
-        let seconds = option_value(args, &[flag]).and_then(|value| value.parse::<f64>().ok()).unwrap_or(default);
-        Duration::try_from_secs_f64(if seconds.is_finite() { seconds.max(minimum) } else { seconds })
-            .map_err(|_| Failure {
-                exit: EXIT_USAGE, code: "invalid_duration", message: format!("{flag} 需要有限且可表示的秒数"), hint: None,
-            })
+        let invalid = || Failure {
+            exit: EXIT_USAGE,
+            code: "invalid_duration",
+            message: format!("{flag} 需要有限且可表示的非负秒数"),
+            hint: None,
+        };
+        let eq_prefix = format!("{flag}=");
+        let raw = if let Some(index) = args.iter().position(|arg| arg == flag) {
+            Some(args.get(index + 1).map(String::as_str).ok_or_else(invalid)?)
+        } else {
+            args.iter().find_map(|arg| arg.strip_prefix(&eq_prefix))
+        };
+        let seconds = match raw {
+            Some(value) => {
+                let parsed = value.parse::<f64>().map_err(|_| invalid())?;
+                if !parsed.is_finite() || parsed < 0.0 {
+                    return Err(invalid());
+                }
+                parsed
+            }
+            None => default,
+        };
+        Duration::try_from_secs_f64(seconds.max(minimum)).map_err(|_| invalid())
     };
     let timeout = duration("--timeout", 600.0, 0.0)?;
     let interval = duration("--interval", 2.0, 0.5)?;
@@ -350,7 +368,14 @@ pub fn doctor(scan_paths: &[String]) -> (Value, u8) {
             Some(crate::commands::ACCESS_HINT.into()),
         ));
     }
-    if snapshot.readable_roots.is_empty() {
+    if snapshot.readable_roots.is_empty() && !snapshot.inaccessible_roots.is_empty() {
+        checks.push(check(
+            "cache_roots",
+            "fail",
+            "检测到缓存目录，但均无读取权限".into(),
+            Some(crate::commands::ACCESS_HINT.into()),
+        ));
+    } else if snapshot.readable_roots.is_empty() {
         checks.push(check(
             "cache_roots",
             "fail",
@@ -399,7 +424,7 @@ pub fn doctor(scan_paths: &[String]) -> (Value, u8) {
         Ok(contents) if shim_matches(&contents) => checks.push(check(
             "cli",
             "warn",
-            format!("wxlocated 已安装，但 {} 不在当前进程的 PATH 中", shim.parent().unwrap_or(&shim).display()),
+            format!("wxlocated 已安装，但 {} 不在当前进程的 PATH 中", shim.parent().unwrap_or(shim).display()),
             Some(if cfg!(windows) { "重新打开终端或 WxLocated 以加载用户 PATH；仍不可用时，在用户环境变量 Path 中加入命令行安装目录".into() } else { "在 shell 配置中加入 export PATH=\"$HOME/.local/bin:$PATH\"".into() }),
         )),
         Ok(_) => checks.push(check("cli", "warn", "wxlocated 指向另一份 WxLocated".into(), Some("在 WxLocated 设置 › Agent 中重新安装命令行工具".into()))),
@@ -425,4 +450,27 @@ pub fn doctor(scan_paths: &[String]) -> (Value, u8) {
         "checks": checks,
     });
     (report, if failed { EXIT_FAILURE } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::watch;
+    use crate::commands::EXIT_USAGE;
+
+    #[test]
+    fn watch_rejects_non_numeric_negative_and_missing_durations() {
+        let cases: &[&[&str]] = &[
+            &["wx0123456789abcdef", "--timeout", "abc"],
+            &["wx0123456789abcdef", "--timeout", "-1"],
+            &["wx0123456789abcdef", "--interval", "inf"],
+            &["wx0123456789abcdef", "--timeout"],
+            &["wx0123456789abcdef", "--timeout=nope"],
+        ];
+        for case in cases {
+            let args: Vec<String> = case.iter().map(|s| (*s).to_string()).collect();
+            let err = watch(&args, &[]).expect_err(&format!("expected failure for {case:?}"));
+            assert_eq!(err.exit, EXIT_USAGE, "{case:?}");
+            assert_eq!(err.code, "invalid_duration", "{case:?}");
+        }
+    }
 }

@@ -7,6 +7,9 @@ use crate::text::has_suffix;
 const MAXIMUM_FORMATTED_BYTES: usize = 8 * 1024 * 1024;
 const OPERATOR_BYTES: &[u8] = b"=+-*%<>!&|?^~/.";
 const CONTROL_KEYWORDS: &[&str] = &["if", "for", "while", "switch", "catch", "with"];
+const KEYWORD_SPACE_BEFORE_UNARY: &[&str] = &[
+    "return", "throw", "case", "typeof", "void", "delete", "yield", "await", "in", "of", "instanceof", "new", "else",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Context {
@@ -68,7 +71,8 @@ pub fn format(source: &str) -> String {
         Writer { output: String::with_capacity((source.len() * 2).min(MAXIMUM_FORMATTED_BYTES * 2)), indentation: 0, line_start: true };
     let mut contexts: Vec<Context> = Vec::new();
     let mut parenthesis_depth = 0usize;
-    let mut pending_ternary = 0usize;
+    let mut ternary_depths: Vec<usize> = Vec::new();
+    let mut previous_cluster: Option<String> = None;
     let mut index = 0;
 
     while index < tokens.len() {
@@ -79,12 +83,16 @@ pub fn format(source: &str) -> String {
         if let Kind::Punctuator(byte) = token.kind
             && OPERATOR_BYTES.contains(&byte)
         {
-            let cluster_end = operator_cluster_end(index, &tokens);
+            let cluster_end = operator_cluster_end(index, &tokens, bytes);
             let cluster = String::from_utf8_lossy(&bytes[token.start..tokens[cluster_end].end]).into_owned();
-            let unary = is_unary_operator(&cluster, previous, previous.map(|p| p.text(bytes)).as_deref());
+            let unary = is_unary_operator(&cluster, previous, previous_cluster.as_deref());
             let attached = matches!(cluster.as_str(), "." | "?." | "..." | "++" | "--") || unary;
+            let prefix_operator = unary || matches!(cluster.as_str(), "++" | "--" | "...");
             writer.indent_if_needed();
-            if !attached {
+            if !attached
+                || (prefix_operator
+                    && previous.and_then(Token::identifier).is_some_and(|kw| KEYWORD_SPACE_BEFORE_UNARY.contains(&kw)))
+            {
                 writer.space();
             }
             writer.output.push_str(&cluster);
@@ -92,10 +100,15 @@ pub fn format(source: &str) -> String {
                 writer.space();
             }
             if cluster == "?" {
-                pending_ternary += 1;
+                ternary_depths.push(contexts.len());
             }
+            previous_cluster = Some(cluster);
             index = cluster_end + 1;
             continue;
+        }
+
+        if !token.is_comment() {
+            previous_cluster = None;
         }
 
         match token.kind {
@@ -131,6 +144,7 @@ pub fn format(source: &str) -> String {
             }
             Kind::Punctuator(b'}') => {
                 let context = pop_context(&mut contexts, &[Context::Block, Context::Object]).unwrap_or(Context::Block);
+                ternary_depths.retain(|&depth| depth <= contexts.len());
                 writer.indentation = writer.indentation.saturating_sub(1);
                 if !writer.line_start {
                     writer.newline();
@@ -158,6 +172,7 @@ pub fn format(source: &str) -> String {
                 writer.indent_if_needed();
                 writer.output.push(')');
                 pop_context(&mut contexts, &[Context::Parenthesis]);
+                ternary_depths.retain(|&depth| depth <= contexts.len());
                 parenthesis_depth = parenthesis_depth.saturating_sub(1);
             }
             Kind::Punctuator(b'[') => {
@@ -170,6 +185,7 @@ pub fn format(source: &str) -> String {
                 writer.indent_if_needed();
                 writer.output.push(']');
                 pop_context(&mut contexts, &[Context::Bracket]);
+                ternary_depths.retain(|&depth| depth <= contexts.len());
             }
             Kind::Punctuator(b';') => {
                 writer.trim_trailing_whitespace();
@@ -194,9 +210,9 @@ pub fn format(source: &str) -> String {
             Kind::Punctuator(b':') => {
                 writer.trim_trailing_whitespace();
                 writer.indent_if_needed();
-                if pending_ternary > 0 {
+                if ternary_depths.last() == Some(&contexts.len()) {
                     writer.space();
-                    pending_ternary -= 1;
+                    ternary_depths.pop();
                 }
                 writer.output.push(':');
                 writer.space();
@@ -224,15 +240,54 @@ pub fn format(source: &str) -> String {
     writer.output
 }
 
-fn operator_cluster_end(start: usize, tokens: &[Token]) -> usize {
-    let mut end = start;
-    while end + 1 < tokens.len()
-        && tokens[end].end == tokens[end + 1].start
-        && matches!(tokens[end + 1].kind, Kind::Punctuator(value) if OPERATOR_BYTES.contains(&value))
+fn operator_cluster_end(start: usize, tokens: &[Token], bytes: &[u8]) -> usize {
+    let mut max_end = start;
+    while max_end + 1 < tokens.len()
+        && max_end - start < 3
+        && tokens[max_end].end == tokens[max_end + 1].start
+        && matches!(tokens[max_end + 1].kind, Kind::Punctuator(value) if OPERATOR_BYTES.contains(&value))
     {
-        end += 1;
+        max_end += 1;
     }
-    end
+    for end in (start + 1..=max_end).rev() {
+        let candidate = &bytes[tokens[start].start..tokens[end].end];
+        let matched = match candidate.len() {
+            4 => candidate == b">>>=",
+            3 => matches!(
+                candidate,
+                b"===" | b"!==" | b">>>" | b"<<=" | b">>=" | b"**=" | b"&&=" | b"||=" | b"??=" | b"..."
+            ),
+            2 => matches!(
+                candidate,
+                b"==" | b"!="
+                    | b"<="
+                    | b">="
+                    | b"=>"
+                    | b"++"
+                    | b"--"
+                    | b"<<"
+                    | b">>"
+                    | b"&&"
+                    | b"||"
+                    | b"??"
+                    | b"**"
+                    | b"?."
+                    | b"+="
+                    | b"-="
+                    | b"*="
+                    | b"/="
+                    | b"%="
+                    | b"&="
+                    | b"|="
+                    | b"^="
+            ),
+            _ => false,
+        };
+        if matched {
+            return end;
+        }
+    }
+    start
 }
 
 fn is_unary_operator(value: &str, previous: Option<&Token>, previous_raw: Option<&str>) -> bool {
@@ -345,18 +400,37 @@ fn next_token_can_continue_statement(tokens: &[Token], current: usize) -> bool {
 mod tests {
     use super::*;
 
-    /// Traced by hand through the Swift rules (note `return-a`: a unary
-    /// operator is attached on both sides, including after a keyword).
     #[test]
     fn formats_statements_and_blocks() {
         assert_eq!(
             format("function f(a){if(a>1){return -a}else{return {x:1,y:[2,3]}}}"),
-            "function f(a) {\n    if (a > 1) {\n        return-a\n    } else {\n        return {\n            x: 1,\n            y: [2, 3]\n        }\n    }\n}\n"
+            "function f(a) {\n    if (a > 1) {\n        return -a\n    } else {\n        return {\n            x: 1,\n            y: [2, 3]\n        }\n    }\n}\n"
         );
     }
 
     #[test]
     fn ternary_spacing() {
         assert_eq!(format("var a=b?c:d;"), "var a = b ? c : d;\n");
+    }
+
+    #[test]
+    fn splits_adjacent_operators_and_preserves_unary_spacing() {
+        assert_eq!(
+            format("var x=!y;a=-b;a===!0&&!c;a++ - b;a - -b;"),
+            "var x = !y;\na = -b;\na === !0 && !c;\na++ - b;\na - -b;\n"
+        );
+        assert_eq!(format("return !a"), "return !a\n");
+    }
+
+    #[test]
+    fn ternary_with_object_literals_keeps_object_colons() {
+        assert_eq!(
+            format("a?{x:1}:{y:2}"),
+            "a ? {\n    x: 1\n} : {\n    y: 2\n}\n"
+        );
+        assert_eq!(
+            format("var o={a:b?{x:1}:2}"),
+            "var o = {\n    a: b ? {\n        x: 1\n    } : 2\n}\n"
+        );
     }
 }

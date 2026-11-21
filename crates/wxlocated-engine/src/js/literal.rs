@@ -19,7 +19,12 @@ pub enum Literal {
 impl Literal {
     pub fn integer_value(&self) -> Option<i64> {
         match self {
-            Self::Number(value) if value.round() == *value && *value >= i64::MIN as f64 && *value <= i64::MAX as f64 => {
+            Self::Number(value)
+                if value.is_finite()
+                    && value.round() == *value
+                    && *value >= i64::MIN as f64
+                    && *value < (1u64 << 63) as f64 =>
+            {
                 Some(*value as i64)
             }
             _ => None,

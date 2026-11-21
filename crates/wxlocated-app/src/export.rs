@@ -64,7 +64,6 @@ fn start_material_export(app: Miniapp, context: MaterialContext, choose_director
             redact: settings.redact_exports,
             include_raw: settings.export_include_raw,
             include_source: settings.export_include_source,
-            ..Options::default()
         };
         let retry_app = app.clone();
         let retry_context = context.clone();

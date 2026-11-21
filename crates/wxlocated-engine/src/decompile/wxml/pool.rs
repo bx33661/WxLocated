@@ -69,7 +69,7 @@ pub fn extract_pools(source: &str) -> OperationPools {
         };
         // An entry that cannot be read still takes its slot, so later
         // indices stay aligned.
-        let value = PoolEntryParser { tokens: &tokens, bytes, earlier }.parse(value_index).map(|(value, _)| value);
+        let value = PoolEntryParser { tokens: &tokens, bytes, earlier }.parse(value_index, 0).map(|(value, _)| value);
         let decoded = value.as_ref().map_or_else(|| "{{__wxlocated_unreadable}}".to_string(), decode);
         let raw = value.unwrap_or(Literal::Null);
         match group {
@@ -310,7 +310,7 @@ fn literal(value: &Literal) -> String {
 
 /// `value.rounded() == value ? String(Int(value)) : String(value)`.
 pub fn swift_number_text(value: f64) -> String {
-    if value.round() == value {
+    if value.is_finite() && value.round() == value && value >= i64::MIN as f64 && value < (1u64 << 63) as f64 {
         return (value as i64).to_string();
     }
     swift_double_description(value)
@@ -355,8 +355,13 @@ struct PoolEntryParser<'a> {
     earlier: &'a [Literal],
 }
 
+const MAXIMUM_POOL_DEPTH: usize = 128;
+
 impl PoolEntryParser<'_> {
-    fn parse(&self, index: usize) -> Option<(Literal, usize)> {
+    fn parse(&self, index: usize, depth: usize) -> Option<(Literal, usize)> {
+        if depth >= MAXIMUM_POOL_DEPTH {
+            return None;
+        }
         let tokens = self.tokens;
         let token = tokens.get(index)?;
         match &token.kind {
@@ -371,7 +376,7 @@ impl PoolEntryParser<'_> {
                         cursor += 1;
                         continue;
                     }
-                    let (value, next) = self.parse(cursor)?;
+                    let (value, next) = self.parse(cursor, depth + 1)?;
                     values.push(value);
                     cursor = next;
                 }
@@ -379,7 +384,7 @@ impl PoolEntryParser<'_> {
             }
             Kind::String(value) => Some((Literal::String(value.clone()), index + 1)),
             Kind::Number => parse_swift_double(&token.text(self.bytes)).map(|number| (Literal::Number(number), index + 1)),
-            Kind::Punctuator(b'-') => match self.parse(index + 1)? {
+            Kind::Punctuator(b'-') => match self.parse(index + 1, depth + 1)? {
                 (Literal::Number(number), next) => Some((Literal::Number(-number), next)),
                 _ => None,
             },
@@ -445,5 +450,14 @@ mod tests {
         assert_eq!(swift_number_text(0.5), "0.5");
         assert_eq!(swift_number_text(0.00001), "1e-05");
         assert_eq!(swift_number_text(-1.5e-7), "-1.5e-07");
+        assert_eq!(swift_number_text(1e20), "1e+20");
+        assert_eq!(swift_number_text(f64::INFINITY), "inf");
+    }
+
+    #[test]
+    fn deeply_nested_pool_entry_degrades_safely() {
+        let depth = MAXIMUM_POOL_DEPTH + 16;
+        let entry = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        assert_eq!(decode_source(&entry), "{{__wxlocated_unreadable}}");
     }
 }

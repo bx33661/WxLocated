@@ -8566,7 +8566,6 @@ dependencies = [
  "aes 0.9.4",
  "directories",
  "hex",
- "libc",
  "pbkdf2 0.13.0",
  "plist",
  "regex",

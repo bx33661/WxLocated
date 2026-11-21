@@ -31,7 +31,7 @@ pub fn schedule(gallery: AnyWindowHandle, gallery_view: Entity<crate::gallery::G
         settle(cx).await;
         capture(gallery, &directory.join("gallery.png"), cx);
 
-        let first = app_id.clone().or_else(|| library.read_with(cx, |library, _| library.apps().first().map(|a| a.app_id.clone())));
+        let first = app_id.clone().or_else(|| library.read_with(cx, |library, _| library.all_apps().first().map(|a| a.app_id.clone())));
         if let Some(id) = first.clone() {
             cx.update(|cx| {
                 gallery
@@ -43,7 +43,7 @@ pub fn schedule(gallery: AnyWindowHandle, gallery_view: Entity<crate::gallery::G
             cx.update(|cx| gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx));
             settle(cx).await;
             capture(gallery, &directory.join("gallery-dark.png"), cx);
-            cx.update(|cx| crate::theme::apply(cx));
+            cx.update(crate::theme::apply);
         }
         cx.update(|cx| crate::settings_view::open_settings(None, cx));
         settle(cx).await;
@@ -87,7 +87,7 @@ pub fn schedule(gallery: AnyWindowHandle, gallery_view: Entity<crate::gallery::G
                 crate::workspace::snapshot_step(handle, "overview", cx);
                 settle(cx).await;
                 capture(handle, &directory.join("app-dark-summary.png"), cx);
-                cx.update(|cx| crate::theme::apply(cx));
+                cx.update(crate::theme::apply);
             }
         }
         cx.update(|cx| cx.quit());

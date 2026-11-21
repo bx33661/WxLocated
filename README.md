@@ -16,7 +16,9 @@
 
 [下载最新版](https://github.com/bx33661/WxLocated/releases/latest)
 
-Windows 解压后运行 `wxlocated-app.exe`，需要对应架构的 [VC++ 运行库](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)。macOS 打开 DMG，将应用拖到“应用程序”。macOS 包采用 ad-hoc 签名，尚未公证。Windows EXE 未做 Authenticode 签名。
+Windows 解压后运行 `wxlocated-app.exe`，需要对应架构的 [VC++ 运行库](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)。macOS 打开 DMG，将应用拖到“应用程序”。macOS 包采用 ad-hoc 签名，尚未公证；Windows EXE 未做 Authenticode 签名。
+
+macOS 首次启动如提示无法验证或已损坏，可在“系统设置 › 隐私与安全性”点击“仍要打开”，或执行 `xattr -dr com.apple.quarantine /Applications/WxLocated.app`。读取微信缓存需在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许 WxLocated；因使用 ad-hoc 签名，覆盖升级后若无法读取，需先从列表移除旧条目再重新添加并重启应用。
 
 启动后从画廊打开已缓存的小程序，也可拖入 `.wxapkg` 文件或包目录。工作区支持核对缺失分包和插件、对照重建与原始内容、定位来源及导出材料。未找到缓存时，可在设置中添加缓存目录。
 

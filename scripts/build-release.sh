@@ -46,11 +46,15 @@ codesign --verify --deep --strict --verbose=2 "$APP"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$APP_ARCHIVE"
 
-PKG_ARGUMENTS=(--component "$APP" --install-location /Applications --identifier com.wxlocated.WxLocated --version "$VERSION")
+COMPONENT_PLIST="$OUTPUT_ROOT/component.plist"
+pkgbuild --analyze --root "$STAGE" "$COMPONENT_PLIST" >/dev/null
+plutil -replace 0.BundleIsRelocatable -bool false "$COMPONENT_PLIST"
+PKG_ARGUMENTS=(--root "$STAGE" --component-plist "$COMPONENT_PLIST" --install-location /Applications --identifier com.wxlocated.WxLocated --version "$VERSION")
 if [[ -n "${DEVELOPER_ID_INSTALLER:-}" ]]; then
   PKG_ARGUMENTS+=(--sign "$DEVELOPER_ID_INSTALLER")
 fi
 pkgbuild "${PKG_ARGUMENTS[@]}" "$PKG"
+rm -f "$COMPONENT_PLIST"
 
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "WxLocated $VERSION" -srcfolder "$STAGE" -format UDZO -ov "$DMG" >/dev/null

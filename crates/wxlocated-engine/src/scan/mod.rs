@@ -24,6 +24,9 @@ pub const DEFAULT_SEARCH_PATHS: &[&str] = &[
     // 4.0 sandbox cache
     "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/radium/Applet/packages",
     "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/radium/Applet/icon",
+    // 4.1.7+ / 4.2.0 account-isolated caches in the standard WeChat container
+    "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/radium/users/*/applet/packages",
+    "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/radium/users/*/applet/icon",
     // Older non-sandbox distribution
     "~/Library/Application Support/WeChat/Applet/packages",
     "~/Library/Application Support/WeChat/Applet/icon",
@@ -48,6 +51,10 @@ pub const DEFAULT_SEARCH_PATHS: &[&str] = &[
     "%APPDATA%/Tencent/WeChat/XPlugin/Plugins/WMPF/*/Applet",
     "%APPDATA%/Tencent/xwechat/radium/Applet",
     "%LOCALAPPDATA%/Tencent/xwechat/radium/Applet",
+    "%APPDATA%/Tencent/xwechat/radium/users/*/applet/packages",
+    "%APPDATA%/Tencent/xwechat/radium/users/*/applet/icon",
+    "%LOCALAPPDATA%/Tencent/xwechat/radium/users/*/applet/packages",
+    "%LOCALAPPDATA%/Tencent/xwechat/radium/users/*/applet/icon",
 ];
 
 /// Each candidate only opens the package index and a few bounded JSON entries,
@@ -159,18 +166,34 @@ fn scan_paths(paths: &[String]) -> Snapshot {
     let mut app_indices: HashMap<String, usize> = HashMap::new();
     let mut icons: HashMap<String, (SystemTime, Vec<u8>)> = HashMap::new();
     let mut seen_packages = HashSet::new();
+    let mut seen_inaccessible = HashSet::new();
     let started = std::time::Instant::now();
 
-    for root in normalized_roots(paths) {
+    let (roots, blocked_roots) = normalized_roots(paths);
+    for blocked in blocked_roots {
+        if seen_inaccessible.insert(identity_key(&blocked, None)) {
+            snapshot.inaccessible_roots.push(blocked);
+        }
+    }
+
+    for root in roots {
         match std::fs::metadata(&root) {
             Ok(metadata) if metadata.is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                if seen_inaccessible.insert(identity_key(&root, None)) {
+                    snapshot.inaccessible_roots.push(root);
+                }
+                continue;
+            }
             _ => {
                 snapshot.missing_roots.push(root);
                 continue;
             }
         }
         if !is_readable(&root) {
-            snapshot.inaccessible_roots.push(root);
+            if seen_inaccessible.insert(identity_key(&root, None)) {
+                snapshot.inaccessible_roots.push(root);
+            }
             continue;
         }
         snapshot.readable_roots.push(root.clone());
@@ -436,59 +459,92 @@ fn prefixed_source(prefix: &str, source: Option<&str>) -> String {
     }
 }
 
-fn normalized_roots(paths: &[String]) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExpandedRoots {
+    candidates: Vec<PathBuf>,
+    inaccessible: Vec<PathBuf>,
+}
+
+fn normalized_roots(paths: &[String]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut seen_roots = HashSet::new();
+    let mut seen_inaccessible = HashSet::new();
     let mut roots = Vec::new();
+    let mut inaccessible = Vec::new();
     for path in paths {
-        for url in expanded_roots(path) {
+        let expanded = expanded_roots(path);
+        for url in expanded.candidates {
             let normalized = std::fs::canonicalize(&url).unwrap_or(url);
-            if seen.insert(identity_key(&normalized, None)) {
+            if seen_roots.insert(identity_key(&normalized, None)) {
                 roots.push(normalized);
             }
         }
+        for url in expanded.inaccessible {
+            let normalized = std::fs::canonicalize(&url).unwrap_or(url);
+            if seen_inaccessible.insert(identity_key(&normalized, None)) {
+                inaccessible.push(normalized);
+            }
+        }
     }
-    roots
+    (roots, inaccessible)
 }
 
-fn expanded_roots(path: &str) -> Vec<PathBuf> {
+fn expanded_roots(path: &str) -> ExpandedRoots {
+    use std::io::ErrorKind;
     use std::path::Component;
+
     let expanded = crate::platform::expand_path(path);
     if !expanded.components().any(|component| component.as_os_str() == "*") {
-        return vec![expanded];
+        return ExpandedRoots { candidates: vec![expanded], inaccessible: Vec::new() };
     }
     let mut candidates = vec![PathBuf::new()];
+    let mut inaccessible = Vec::new();
     for component in expanded.components() {
         if matches!(component, Component::Normal(name) if name == "*") {
-            candidates = candidates
-                .iter()
-                .flat_map(|parent| {
-                    let mut children: Vec<PathBuf> = std::fs::read_dir(if parent.as_os_str().is_empty() { Path::new(".") } else { parent })
-                        .map(|entries| {
-                            entries
-                                .filter_map(Result::ok)
-                                .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
-                                .filter(|entry| std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()))
-                                .map(|entry| entry.path())
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if parent.file_name().is_some_and(|name| name == "Containers") {
-                        children.retain(|child| is_likely_host_container(&file_name(child)));
+            let mut next_candidates = Vec::new();
+            for parent in &candidates {
+                let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent.as_path() };
+                let entries = match std::fs::read_dir(dir) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        if error.kind() == ErrorKind::PermissionDenied {
+                            inaccessible.push(dir.to_path_buf());
+                        }
+                        continue;
                     }
-                    children
-                })
-                .collect();
+                };
+                let mut children: Vec<PathBuf> = entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+                    .filter(|entry| std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()))
+                    .map(|entry| entry.path())
+                    .collect();
+                if parent.file_name().is_some_and(|name| name == "Containers") {
+                    children.retain(|child| is_likely_host_container(&file_name(child)));
+                }
+                next_candidates.extend(children);
+            }
+            candidates = next_candidates;
         } else {
-            candidates =
-                candidates.iter().map(|parent| parent.join(component.as_os_str())).filter(|child| {
-                    matches!(component, Component::Prefix(_) | Component::RootDir) || child.is_dir()
-                }).collect();
+            let mut next_candidates = Vec::new();
+            for parent in &candidates {
+                let child = parent.join(component.as_os_str());
+                if matches!(component, Component::Prefix(_) | Component::RootDir) {
+                    next_candidates.push(child);
+                    continue;
+                }
+                match std::fs::metadata(&child) {
+                    Ok(metadata) if metadata.is_dir() => next_candidates.push(child),
+                    Err(error) if error.kind() == ErrorKind::PermissionDenied => inaccessible.push(child),
+                    _ => {}
+                }
+            }
+            candidates = next_candidates;
         }
         if candidates.is_empty() {
             break;
         }
     }
-    candidates
+    ExpandedRoots { candidates, inaccessible }
 }
 
 fn is_likely_host_container(name: &str) -> bool {
@@ -542,15 +598,6 @@ fn identity_key(path: &Path, metadata: Option<&std::fs::Metadata>) -> String {
     format!("path:{}", normalized.to_string_lossy())
 }
 
-#[cfg(unix)]
-fn is_readable(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
-    // SAFETY: `c_path` is a valid NUL-terminated string for the duration of the call.
-    unsafe { libc::access(c_path.as_ptr(), libc::R_OK) == 0 }
-}
-
-#[cfg(not(unix))]
 fn is_readable(path: &Path) -> bool {
     std::fs::read_dir(path).is_ok()
 }
@@ -563,16 +610,32 @@ fn extension_is(path: &Path, extension: &str) -> bool {
     path.extension().is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case(extension))
 }
 
+fn is_strict_app_id(name: &str) -> bool {
+    name.len() == 18 && name.starts_with("wx") && name[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_excluded_wx_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["wxid_", "wxlocated", "wxapplet", "wxcomponents", "wxwork"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
 fn is_app_id_like(name: &str) -> bool {
+    if is_strict_app_id(name) {
+        return true;
+    }
     name.len() >= 10
         && name.starts_with("wx")
         && name[2..].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && name[2..].bytes().any(|b| b.is_ascii_digit())
+        && !is_excluded_wx_name(name)
 }
 
-/// The nearest path component shaped like an AppID, else the first such run
-/// anywhere in the path.
+/// The nearest strict AppID component, else an embedded strict AppID run, else
+/// the nearest AppID-like component or run.
 fn app_id_from_path(path: &Path) -> Option<String> {
-    if let Some(component) = path.components().rev().filter_map(|c| c.as_os_str().to_str()).find(|name| is_app_id_like(name)) {
+    if let Some(component) = path.components().rev().filter_map(|c| c.as_os_str().to_str()).find(|name| is_strict_app_id(name)) {
         return Some(component.to_string());
     }
     let text = path.to_string_lossy();
@@ -580,9 +643,27 @@ fn app_id_from_path(path: &Path) -> Option<String> {
     let mut index = 0;
     while let Some(found) = text[index..].find("wx") {
         let start = index + found;
+        let end = start + 18;
+        if let Some(candidate) = text.get(start..end)
+            && is_strict_app_id(candidate)
+            && !bytes.get(end).is_some_and(u8::is_ascii_hexdigit)
+            && !(start > 0 && bytes[start - 1].is_ascii_hexdigit())
+            && !text[..start].to_ascii_lowercase().ends_with("wxid_")
+        {
+            return Some(candidate.to_string());
+        }
+        index = start + 1;
+    }
+    if let Some(component) = path.components().rev().filter_map(|c| c.as_os_str().to_str()).find(|name| is_app_id_like(name)) {
+        return Some(component.to_string());
+    }
+    index = 0;
+    while let Some(found) = text[index..].find("wx") {
+        let start = index + found;
         let end = start + 2 + bytes[start + 2..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_' || **b == b'-').count();
-        if end - start >= 10 {
-            return Some(text[start..end].to_string());
+        let candidate = &text[start..end];
+        if is_app_id_like(candidate) {
+            return Some(candidate.to_string());
         }
         index = start + 1;
     }
@@ -702,9 +783,47 @@ mod tests {
         let fixture = Fixture::new();
         fixture.package("user/Applet/wx0123456789abcdef/1/__APP__.wxapkg");
         let pattern = fixture.0.join("*/Applet");
-        let native = expanded_roots(&pattern.to_string_lossy());
-        let forward = expanded_roots(&pattern.to_string_lossy().replace('\\', "/"));
+        let native = expanded_roots(&pattern.to_string_lossy()).candidates;
+        let forward = expanded_roots(&pattern.to_string_lossy().replace('\\', "/")).candidates;
         assert_eq!(native.len(), 1);
         assert_eq!(native, forward);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_permission_denied_wildcard_parent_as_inaccessible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PermissionGuard(PathBuf);
+        impl Drop for PermissionGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let fixture = Fixture::new();
+        fixture.package("users/acc/applet/packages/wx0123456789abcdef/1/__APP__.wxapkg");
+        let users = fixture.0.join("users");
+        let _guard = PermissionGuard(users.clone());
+        std::fs::set_permissions(&users, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&users).is_ok() {
+            // Skip when running as root, which bypasses directory mode bits.
+            return;
+        }
+        let pattern = fixture.0.join("users/*/applet/packages").to_string_lossy().into_owned();
+        let snapshot = scan_paths(&[pattern]);
+        assert!(snapshot.readable_roots.is_empty());
+        assert_eq!(snapshot.inaccessible_roots.len(), 1);
+        assert!(crate::platform::paths_equal(&snapshot.inaccessible_roots[0], &users));
+    }
+
+    #[test]
+    fn ignores_wechat_user_ids_and_tool_folders_as_app_ids() {
+        assert_eq!(app_id_from_path(Path::new("/Users/a/WeChat Files/wxid_smoke_account/Applet/test.wxapkg")), None);
+        assert_eq!(app_id_from_path(Path::new("/tmp/wxlocated-samples/test.wxapkg")), None);
+        assert_eq!(
+            app_id_from_path(Path::new("/cache/wx0123456789abcdef/1/wxcomponents/sub.wxapkg")).as_deref(),
+            Some("wx0123456789abcdef")
+        );
     }
 }

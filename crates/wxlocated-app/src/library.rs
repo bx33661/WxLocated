@@ -85,6 +85,14 @@ impl Library {
             watched: Vec::new(),
         });
         cx.set_global(GlobalLibrary(library.clone()));
+        cx.on_window_closed(|cx, closed| {
+            if let Some(global) = cx.try_global::<GlobalLibrary>().map(|g| g.0.clone()) {
+                global.update(cx, |library, _| {
+                    library.app_windows.retain(|_, handle| handle.window_id() != closed);
+                });
+            }
+        })
+        .detach();
         if scan {
             library.update(cx, |library, cx| library.refresh(cx));
         }
@@ -189,8 +197,25 @@ impl Library {
         self.snapshot.as_ref().map(|s| s.miniapps.as_slice()).unwrap_or(&[])
     }
 
+    /// Cached apps combined with externally opened `.wxapkg` packages
+    /// (explicitly opened external packages take precedence on matching AppID).
+    pub fn all_apps(&self) -> Vec<Miniapp> {
+        let cached = self.apps();
+        if self.external.is_empty() {
+            return cached.to_vec();
+        }
+        let mut combined = Vec::with_capacity(self.external.len() + cached.len());
+        combined.extend(self.external.iter().rev().cloned());
+        for app in cached {
+            if !self.external.iter().any(|ext| ext.app_id == app.app_id) {
+                combined.push(app.clone());
+            }
+        }
+        combined
+    }
+
     pub fn app(&self, app_id: &str) -> Option<&Miniapp> {
-        self.apps().iter().find(|app| app.app_id == app_id).or_else(|| self.external.iter().find(|app| app.app_id == app_id))
+        self.external.iter().find(|app| app.app_id == app_id).or_else(|| self.apps().iter().find(|app| app.app_id == app_id))
     }
 
     pub fn record_use(&mut self, app_id: &str, cx: &mut Context<Self>) {
@@ -203,8 +228,12 @@ impl Library {
 
     /// Builds an app from dropped `.wxapkg` files or folders.
     pub fn open_external(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> Option<String> {
-        let app = scan::external_app(paths)?;
+        let mut app = scan::external_app(paths)?;
         let id = app.app_id.clone();
+        if let Some(name) = self.settings.custom_app_names.get(&id) {
+            app.name = Some(name.clone());
+            app.metadata_source = Some("自定义名称".into());
+        }
         let context = self.snapshot.as_ref().map(|snapshot| wxlocated_engine::material::Context::for_app(snapshot, &app)).unwrap_or_default();
         let material = app.clone();
         let facts = cx.background_executor().spawn(async move { derive(&material, &context) });
@@ -240,9 +269,18 @@ impl Library {
     pub fn set_custom_name(&mut self, app_id: &str, name: Option<String>, cx: &mut Context<Self>) {
         match name.map(|n| n.trim().chars().take(80).collect::<String>()).filter(|n| !n.is_empty()) {
             Some(name) => {
+                if let Some(existing) = self.external.iter_mut().find(|app| app.app_id == app_id) {
+                    existing.name = Some(name.clone());
+                    existing.metadata_source = Some("自定义名称".into());
+                }
                 self.settings.custom_app_names.insert(app_id.to_string(), name);
             }
             None => {
+                if let Some(existing) = self.external.iter_mut().find(|app| app.app_id == app_id)
+                    && let Some(fresh) = scan::external_app(&existing.all_packages())
+                {
+                    *existing = fresh;
+                }
                 self.settings.custom_app_names.remove(app_id);
             }
         }

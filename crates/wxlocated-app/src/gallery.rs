@@ -162,9 +162,8 @@ impl Gallery {
     }
 
     fn move_selection(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let snapshot = self.library.read(cx).snapshot.clone();
-        let all_apps = snapshot.as_deref().map_or(&[][..], |snapshot| snapshot.miniapps.as_slice());
-        let apps = self.visible_apps(all_apps, cx);
+        let all_apps = self.library.read(cx).all_apps();
+        let apps = self.visible_apps(&all_apps, cx);
         if apps.is_empty() {
             return;
         }
@@ -713,6 +712,11 @@ impl Gallery {
                     .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child("扫描范围有缺口"))
                     .child(div().text_size(px(11.5)).text_color(palette.secondary).child(description)),
             )
+            .when(cfg!(target_os = "macos") && inaccessible > 0, |this| {
+                this.child(Button::new("cov-privacy").label("打开隐私设置").small().on_click(|_, _, cx| {
+                    cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                }))
+            })
             .child(Button::new("cov-add").label("添加目录…").small().on_click(|_, _, cx| crate::settings_view::add_folder(cx)))
             .child(Button::new("cov-diag").label("查看诊断").small().ghost().on_click(|_, _, cx| {
                 crate::settings_view::open_settings(Some(crate::settings_view::Tab::Scan), cx)
@@ -816,7 +820,7 @@ impl Gallery {
             "正在查找微信缓存中的小程序包…"
         } else if inaccessible {
             if cfg!(target_os = "macos") {
-                "部分缓存目录没有访问权限。在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许 WxLocated，然后重新扫描。"
+                "部分缓存目录没有访问权限。在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许 WxLocated，然后重启并重新扫描（如升级前已勾选旧版，请先用「-」移除再重新添加）。"
             } else {
                 "部分缓存目录没有访问权限。请确认当前用户具有读取权限，或添加可读取的 Applet 缓存目录。"
             }
@@ -848,7 +852,7 @@ impl Gallery {
                             this.library.update(cx, |library, cx| library.refresh(cx))
                         })))
                         .child(Button::new("add-folder").icon(IconName::FolderPlus).label("添加目录…").on_click(|_, _, cx| crate::settings_view::add_folder(cx)))
-                        .when(inaccessible, |this| {
+                        .when(cfg!(target_os = "macos") && inaccessible, |this| {
                             this.child(Button::new("privacy").label("打开隐私设置").ghost().on_click(|_, _, cx| {
                                 cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
                             }))
@@ -898,9 +902,8 @@ impl Render for Gallery {
         let width = f32::from(window.viewport_size().width) - PADDING * 2. + TILE_GAP;
         self.columns = ((width / (TILE_WIDTH + TILE_GAP)).floor() as usize).max(2);
         let library = self.library.read(cx);
-        let snapshot = library.snapshot.clone();
-        let all_apps = snapshot.as_deref().map_or(&[][..], |snapshot| snapshot.miniapps.as_slice());
-        let apps = self.visible_apps(all_apps, cx);
+        let all_apps = library.all_apps();
+        let apps = self.visible_apps(&all_apps, cx);
         let total = all_apps.len();
         let (rebuilt_count, incomplete_count) = all_apps.iter().fold((0, 0), |(rebuilt, incomplete), app| {
             (rebuilt + usize::from(library.rebuilt.contains_key(&app.app_id)), incomplete + usize::from(library.derived_ref(&app.app_id).is_incomplete()))

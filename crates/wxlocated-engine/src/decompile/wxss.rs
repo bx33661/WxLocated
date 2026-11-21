@@ -322,10 +322,11 @@ impl Renderer<'_> {
         match value {
             Literal::String(text) => text.clone(),
             Literal::Number(number) => {
-                if number.round() != *number {
-                    return swift_double_description(*number);
+                if let Some(id) = value.integer_value() {
+                    self.render_pool(id, current_path, stack, unknown)
+                } else {
+                    swift_double_description(*number)
                 }
-                self.render_pool(*number as i64, current_path, stack, unknown)
             }
             Literal::Array(items) => {
                 match (items.first().and_then(Literal::integer_value), items.len()) {
@@ -385,8 +386,11 @@ impl Renderer<'_> {
 }
 
 fn numeric_text(value: &Literal) -> String {
+    if let Some(integer) = value.integer_value() {
+        return integer.to_string();
+    }
     let Literal::Number(number) = value else { return "0".into() };
-    if number.round() == *number { (*number as i64).to_string() } else { swift_double_description(*number) }
+    swift_double_description(*number)
 }
 
 /// `page-frame`/`app-wxss` containers are the app stylesheet; any other file
