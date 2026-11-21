@@ -84,48 +84,48 @@ pub struct Palette {
 pub fn palette(cx: &App) -> Palette {
     if cx.theme().is_dark() {
         Palette {
-            accent: hex(0x3CCBA9),
-            accent_soft: hexa(0x3CCBA9, 0.16),
-            on_accent: hex(0x06221B),
-            ink: hex(0xB9F0DC),
-            success: hex(0x63D38A),
-            warning: hex(0xE6B95F),
-            error: hex(0xFF7D8C),
-            raised: hex(0x1E2423),
-            fill: hexa(0xFFFFFF, 0.045),
-            fill_strong: hexa(0xFFFFFF, 0.08),
+            accent: hex(0x2DD4BF),
+            accent_soft: hexa(0x2DD4BF, 0.13),
+            on_accent: hex(0x042F2E),
+            ink: hex(0xF4F4F6),
+            success: hex(0x4ADE80),
+            warning: hex(0xFBBF24),
+            error: hex(0xFB7185),
+            raised: hex(0x1E1E24),
+            fill: hexa(0xFFFFFF, 0.05),
+            fill_strong: hexa(0xFFFFFF, 0.085),
             hairline: hexa(0xFFFFFF, 0.08),
-            code: hex(0x121615),
-            code_chrome: hex(0x181D1C),
-            sidebar: hexa(0x1A1F1E, 0.86),
-            window: hex(0x151918),
-            text: hex(0xE3E9E7),
-            secondary: hex(0x97A39F),
-            tertiary: hex(0x63706C),
-            shadow: hexa(0x000000, 0.45),
+            code: hex(0x111114),
+            code_chrome: hex(0x17171C),
+            sidebar: hexa(0x101013, 0.94),
+            window: hex(0x141417),
+            text: hex(0xF4F4F6),
+            secondary: hex(0x9E9EA8),
+            tertiary: hex(0x62626D),
+            shadow: hexa(0x000000, 0.55),
             is_dark: true,
         }
     } else {
         Palette {
-            accent: hex(0x0E957C),
-            accent_soft: hexa(0x0E957C, 0.11),
+            accent: hex(0x0F766E),
+            accent_soft: hexa(0x0F766E, 0.10),
             on_accent: hex(0xFFFFFF),
-            ink: hex(0x254B43),
-            success: hex(0x2E9D57),
-            warning: hex(0xC27D0E),
-            error: hex(0xD2465A),
+            ink: hex(0x18181B),
+            success: hex(0x16A34A),
+            warning: hex(0xD97706),
+            error: hex(0xE11D48),
             raised: hex(0xFFFFFF),
-            fill: hexa(0x0F2E26, 0.04),
-            fill_strong: hexa(0x0F2E26, 0.075),
-            hairline: hexa(0x0F2E26, 0.09),
-            code: hex(0xFBFCFC),
-            code_chrome: hex(0xF3F6F5),
-            sidebar: hexa(0xEDF2F0, 0.84),
-            window: hex(0xF6F8F7),
-            text: hex(0x1A201E),
-            secondary: hex(0x5F6B67),
-            tertiary: hex(0x98A39F),
-            shadow: hexa(0x0F2E26, 0.11),
+            fill: hexa(0x18181B, 0.045),
+            fill_strong: hexa(0x18181B, 0.08),
+            hairline: hexa(0x18181B, 0.085),
+            code: hex(0xFCFCFD),
+            code_chrome: hex(0xF4F5F7),
+            sidebar: hexa(0xF4F5F7, 0.94),
+            window: hex(0xFFFFFF),
+            text: hex(0x18181B),
+            secondary: hex(0x52525B),
+            tertiary: hex(0x9CA3AF),
+            shadow: hexa(0x09090B, 0.10),
             is_dark: false,
         }
     }
@@ -163,17 +163,17 @@ pub fn hexa(value: u32, alpha: f32) -> Hsla {
     color
 }
 
-/// Soft two-layer shadow for raised surfaces.
+/// Soft shadow for raised surfaces (crisper and restrained for Obsidian Studio).
 pub fn soft_shadow(palette: &Palette, lifted: bool) -> Vec<BoxShadow> {
     let base = palette.shadow;
-    let (near, far) = if lifted { (0.9, 1.4) } else { (0.6, 0.8) };
+    let (near, far) = if lifted { (0.65, 1.0) } else { (0.4, 0.55) };
     vec![
-        BoxShadow { color: base.opacity(near * 0.5), offset: point(px(0.), px(1.)), blur_radius: px(2.), spread_radius: px(0.), inset: false },
+        BoxShadow { color: base.opacity(near * 0.45), offset: point(px(0.), px(1.)), blur_radius: px(2.), spread_radius: px(0.), inset: false },
         BoxShadow {
-            color: base.opacity(far * 0.6),
-            offset: point(px(0.), px(if lifted { 10. } else { 4. })),
-            blur_radius: px(if lifted { 28. } else { 14. }),
-            spread_radius: px(-4.),
+            color: base.opacity(far * 0.5),
+            offset: point(px(0.), px(if lifted { 8. } else { 3. })),
+            blur_radius: px(if lifted { 20. } else { 10. }),
+            spread_radius: px(-3.),
             inset: false,
         },
     ]

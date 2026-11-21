@@ -1,4 +1,5 @@
-//! Inspector sections, package integrity and evidence citations.
+//! Agent handoff, semantic overlay layers, package integrity fingerprints,
+//! and forensic evidence builders.
 
 use std::time::Duration;
 
@@ -7,27 +8,23 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::skeleton::Skeleton;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
-use wxlocated_engine::decompile::{Artifact, Confidence, Content};
-use wxlocated_engine::export::confidence_title;
+use wxlocated_engine::decompile::{Artifact, Content};
 use wxlocated_engine::material::report::{self, Integrity};
 
-use crate::library::RebuildSummary;
 use crate::theme::{Palette, palette};
-use crate::ui::{self, badge, format_size, format_time, section_label};
-use crate::workspace_actions::Rebuild;
+use crate::ui::{self, badge, display_path, format_size, format_time, section_label};
 
-use super::{Loaded, Phase, Preview, View, Workspace};
+use super::{Loaded, Phase, View, Workspace};
 
 impl Workspace {
-    fn copy_evidence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn copy_evidence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((loaded, index)) = self.selected.as_ref().and_then(|path| self.artifact(path)) else { return };
         let (reading, line) = match &self.preview {
-            Preview::Code(editor) => {
+            super::Preview::Code(editor) => {
                 let state = editor.read(cx);
                 (Some(state.text().clone()), (!self.compare).then_some(i64::from(state.cursor_position().line) + 1))
             }
@@ -64,8 +61,10 @@ impl Workspace {
                     Err(error) => window.push_notification(Notification::error(error).title("无法复制证据"), cx),
                 }
                 cx.notify();
-            }).ok();
-        }).detach();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn mark_copied(&mut self, key: &'static str, cx: &mut Context<Self>) {
@@ -84,170 +83,116 @@ impl Workspace {
         .detach();
     }
 
-    pub(super) fn render_inspector(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_agent_tab(&self, cx: &mut Context<Self>) -> AnyElement {
         let palette = palette(cx);
-        let mut sections: Vec<AnyElement> = Vec::new();
-        // Click a heading to fold its section; folded sections show only the heading.
-        let weak = cx.entity().downgrade();
-        let collapsed = self.collapsed.clone();
-        let section = |title: &'static str, palette: &Palette| {
-            let folded = collapsed.contains(title);
-            let weak = weak.clone();
-            let accessible = weak.clone();
-            v_flex()
-                .w_full()
-                .gap(px(9.))
-                .when(folded, |this| this.h(px(18.)).overflow_hidden())
-                .child(
-                    h_flex()
-                        .id(title)
-                        .role(Role::Button)
-                        .aria_label(format!("{}{}", if folded { "展开" } else { "折叠" }, title))
-                        .on_a11y_action(AccessibleAction::Click, move |_, _, cx| {
-                            accessible.update(cx, |this, cx| {
-                                if !this.collapsed.remove(title) { this.collapsed.insert(title); }
-                                cx.notify();
-                            }).ok();
-                        })
-                        .gap_1()
-                        .cursor_pointer()
-                        .child(div().text_size(px(10.)).text_color(palette.tertiary).child(if folded { IconName::ChevronRight } else { IconName::ChevronDown }))
-                        .child(section_label(title, None, palette))
-                        .on_click(move |_, _, cx| {
-                            weak.update(cx, |this, cx| {
-                                if !this.collapsed.remove(title) {
-                                    this.collapsed.insert(title);
-                                }
-                                cx.notify();
-                            })
-                            .ok();
-                        }),
-                )
-        };
-
-        if let Some((loaded, index)) = self.selected.as_ref().and_then(|p| self.artifact(p)) {
-            let artifact = &loaded.result.artifacts[index];
-            let size = match &artifact.content {
-                Content::Generated(text) => text.len() as i64,
-                Content::Entry(entry) => loaded.set.entries[*entry].size as i64,
-            };
-            let (color, explanation) = match artifact.confidence {
-                Confidence::Exact => (palette.success, "与包内字节或 Source Map 原文一致。".to_string()),
-                Confidence::High => (palette.accent, "按编译结构确定性还原，语义应与原文一致。".to_string()),
-                Confidence::Medium => (palette.warning, ui::shortcut("部分结构为推导结果，引用前请对照原始文件（⌥⌘R）。")),
-                Confidence::Low => (palette.warning, ui::shortcut("只能部分还原，保留了原始片段与诊断，请以原始文件为准（⌥⌘R）。")),
-            };
-            let path = artifact.path.clone();
-            sections.push(
-                section("当前文件", &palette)
-                    .child(h_flex().gap_2().child(badge(confidence_title(artifact.confidence), color)).child(div().text_size(px(11.5)).text_color(palette.secondary).child(format_size(size))))
-                    .child(div().text_size(px(11.5)).text_color(palette.secondary).child(explanation))
-                    .child(
-                        v_flex().id("source-precision").role(Role::Status).aria_label("来源匹配精度").gap_1()
-                            .child(div().text_size(px(11.5)).font_weight(FontWeight::MEDIUM).child("来源匹配"))
-                            .child(div().text_size(px(11.5)).text_color(palette.secondary)
-                                .child(self.evidence.as_ref().map(evidence_method).unwrap_or("尚未定位")))
-                            .child(div().text_size(px(11.)).text_color(palette.secondary).child("复制时按当前光标重新定位。"))
-                            .when_some(self.evidence.as_ref().and_then(|value| value["match"]["note"].as_str()), |this, note| {
-                                this.child(div().text_size(px(11.)).text_color(palette.secondary).child(note.to_string()))
-                            })
-                            .when_some(self.evidence.as_ref().and_then(|value| value["match"]["candidates"].as_u64()).filter(|n| *n > 1), |this, count| {
-                                this.child(div().text_size(px(11.)).text_color(palette.warning).child(format!("有 {count} 处相同文本，当前采用第一处，请核对。")))
-                            })
-                            .child(Button::new("copy-evidence").icon(IconName::Copy).label("复制证据引用").accessibility_label("复制当前光标对应的原始包证据引用")
-                                .xsmall().loading(self.copying_evidence).disabled(self.copying_evidence || matches!(self.preview, Preview::Loading | Preview::TooLarge(_) | Preview::Error(_)))
-                                .tooltip(if self.compare { "差异视图提供文件级原始范围；退出对比后可定位当前行" } else { "按当前光标定位，包含包哈希、条目、字节偏移与匹配精度" })
-                                .on_click(cx.listener(|this, _, window, cx| this.copy_evidence(window, cx)))),
-                    )
-                    .when(!artifact.notes.is_empty(), |this| {
-                        this.child(
-                            v_flex()
-                                .gap_1()
-                                .child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(palette.tertiary).child("恢复步骤"))
-                                .children(artifact.notes.iter().take(6).map(|note| div().text_size(px(11.5)).text_color(palette.secondary).child(note.clone()))),
-                        )
-                    })
-                    .when(!artifact.sources.is_empty(), |this| {
-                        this.child(
-                            v_flex()
-                                .gap_1()
-                                .child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(palette.tertiary).child("来源"))
-                                .children(artifact.sources.iter().take(4).map(|source| {
-                                    let range = match (source.start, source.end) {
-                                        (Some(start), Some(end)) => format!(" · {start}..<{end}"),
-                                        _ => String::new(),
-                                    };
-                                    div().text_size(px(11.)).font_family(ui::mono_font()).text_color(palette.secondary).child(format!("{}{range}", source.entry_path))
-                                })),
-                        )
-                    })
-                    .child(h_flex().child(Button::new("copy-file-path").icon(IconName::Copy).label("复制路径").xsmall().on_click(move |_, _, cx| ui::copy(path.clone(), cx))))
-                    .into_any_element(),
-            );
-        }
-
-        let app = &self.app;
+        let app = self.app.clone();
+        let context = self.context(cx);
         let folder = app.cache_directory();
+        let folder_display = display_path(&folder.to_string_lossy());
         let folder_copy = folder.to_string_lossy().into_owned();
-        let format = self.loaded().and_then(|l| l.set.sources.first().map(|s| s.archive.format.as_str().to_string()));
-        sections.push(
-            section("应用", &palette)
-                .child(ui::info_row("AppID", app.app_id.clone(), &palette, true))
-                .child(ui::info_row("版本", app.version.clone().unwrap_or_else(|| "未知".into()), &palette, false))
-                .child(ui::info_row("大小", format_size(app.size), &palette, false))
-                .child(ui::info_row("包", if app.sub_packages.is_empty() { "仅主包".into() } else { format!("主包 + {} 个分包", app.sub_packages.len()) }, &palette, false))
-                .when_some(format, |this, format| this.child(ui::info_row("格式", format, &palette, false)))
-                .child(ui::info_row("修改", format_time(app.modified), &palette, false))
-                .child(ui::info_row("名称来源", app.metadata_source.clone().unwrap_or_else(|| "文件路径与属性".into()), &palette, false))
-                .child(ui::info_row("目录", ui::display_path(&folder_copy), &palette, true))
-                .child(
-                    h_flex()
-                        .pt_1()
-                        .gap_1p5()
-                        .child(Button::new("app-reveal").icon(IconName::FolderOpen).label(wxlocated_engine::platform::file_manager_name()).xsmall().on_click(move |_, _, cx| cx.reveal_path(&folder)))
-                        .child(Button::new("app-copy").icon(IconName::Copy).label("复制路径").xsmall().on_click(move |_, _, cx| ui::copy(folder_copy.clone(), cx))),
-                )
-                .into_any_element(),
-        );
+        let cli_command = format!("wxlocated export {} --out ./audit-{}", app.app_id, &app.app_id[app.app_id.len().saturating_sub(6)..]);
+        let cli_copied = self.copied == Some("cli-cmd");
 
-        let rebuild = section("源码重建", &palette);
-        sections.push(
-            match &self.phase {
-                Phase::Ready(loaded) => {
-                    let RebuildSummary { generated, degraded } = loaded.summary;
-                    rebuild
-                        .child(ui::info_row("文件", format!("{generated} 个重建 · {} 个原样", loaded.result.artifacts.len() - generated), &palette, false))
-                        .child(ui::info_row("耗时", format!("{:.1} 秒", loaded.seconds), &palette, false))
-                        .when(degraded > 0, |this| this.child(ui::info_row("降级", format!("{degraded} 个文件"), &palette, false).text_color(palette.warning)))
-                }
-                Phase::Loading => rebuild.child(h_flex().gap_2().text_size(px(12.)).text_color(palette.secondary).child(Spinner::new().color(palette.accent)).child("正在重建…")),
-                Phase::Failed(_) => rebuild.child(div().text_size(px(12.)).text_color(palette.secondary).child("这个包无法重建源码")),
-            }
+        // Card 1: Agent Audit Handoff
+        let handoff_card = ui::card(&palette)
+            .p_4()
+            .gap_3()
             .child(
-                h_flex().child(
-                    Button::new("rebuild")
-                        .icon(IconName::RefreshCw)
-                        .label("重新重建")
-                        .xsmall()
-                        .disabled(matches!(self.phase, Phase::Loading))
-                        .on_click(|_, window, cx| window.dispatch_action(Box::new(Rebuild), cx)),
-                ),
+                h_flex()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child("一键导出并交付给 AI 审计 Agent"))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(palette.secondary)
+                                    .child("导出目录会包含 AGENT.md（结构说明）、material.json（完整度清单）、source/（还原源码）与 raw/（原始 wxapkg 证据包）。"),
+                            ),
+                    )
+                    .child(
+                        Button::new("agent-export-prompt")
+                            .flex_none()
+                            .icon(IconName::Sparkles)
+                            .label("导出并复制 Agent 提示词")
+                            .small()
+                            .primary()
+                            .disabled(matches!(self.phase, Phase::Loading))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let id = app.app_id.clone();
+                                let ctx = context.clone();
+                                crate::library::Library::global(cx).update(cx, |library, cx| library.record_use(&id, cx));
+                                crate::export::export_and_copy_prompt(this.app.clone(), ctx, window, cx);
+                            })),
+                    ),
             )
-            .into_any_element(),
-        );
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .rounded(px(8.))
+                    .bg(palette.code)
+                    .border_1()
+                    .border_color(palette.hairline)
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).font_family(ui::mono_font()).text_color(palette.text).child(cli_command.clone()))
+                    .child(
+                        Button::new("copy-cli-cmd")
+                            .icon(if cli_copied { IconName::Check } else { IconName::Copy })
+                            .label(if cli_copied { "已复制" } else { "复制 CLI 命令" })
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                ui::copy(cli_command.clone(), cx);
+                                this.mark_copied("cli-cmd", cx);
+                            })),
+                    ),
+            );
 
-        let layers = section("Agent 重建层", &palette);
-        sections.push(
-            if self.layers.is_empty() {
-                layers.child(
+        // Card 2: Agent Semantic Layers (Overlays)
+        let layers_card = ui::card(&palette)
+            .p_4()
+            .gap_3()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).child("Agent 语义重命名层（Overlay）"))
+                            .child(div().text_size(px(11.5)).text_color(palette.secondary).child("AI 对源码补充变量命名和注释后，可通过 CLI overlay import 或直接选择含 overlay.json 的文件夹导入，在代码区与静态还原结果彩色对照。")),
+                    )
+                    .child(
+                        Button::new("import-overlay-dir")
+                            .flex_none()
+                            .icon(IconName::FolderPlus)
+                            .label("导入重建层目录…")
+                            .small()
+                            .on_click(|_, _, cx| crate::native_open::prompt_open(cx)),
+                    ),
+            )
+            .when(self.layers.is_empty(), |this| {
+                this.child(
                     div()
+                        .p_3()
+                        .rounded(px(8.))
+                        .bg(palette.fill)
                         .text_size(px(11.5))
+                        .font_family(ui::mono_font())
                         .text_color(palette.secondary)
-                        .child("还没有导入。Agent 可以用 wxlocated overlay init 生成工作目录，改完后 overlay import，或者把含 overlay.json 的文件夹拖进这个窗口。"),
+                        .child("提示：wxlocated overlay init <导出目录> <工作目录> → Agent 改写 → wxlocated overlay import <工作目录>"),
                 )
-            } else {
-                layers
-                    .children(self.layers.iter().enumerate().map(|(index, layer)| {
+            })
+            .when(!self.layers.is_empty(), |this| {
+                this.child(
+                    v_flex().gap_1p5().children(self.layers.iter().enumerate().map(|(index, layer)| {
                         let manifest = &layer.manifest;
                         let meta = [manifest.author.agent.clone(), manifest.author.model.clone(), Some(format!("{} 个文件", manifest.files.len()))]
                             .into_iter()
@@ -255,114 +200,145 @@ impl Workspace {
                             .collect::<Vec<_>>()
                             .join(" · ");
                         h_flex()
-                            .items_start()
-                            .gap_2()
-                            .child(div().pt(px(2.)).text_size(px(12.)).text_color(palette.warning).child(IconName::Sparkles))
+                            .items_center()
+                            .gap_3()
+                            .p_2p5()
+                            .rounded(px(8.))
+                            .bg(palette.fill)
+                            .child(div().text_size(px(13.)).text_color(palette.accent).child(IconName::Sparkles))
                             .child(
                                 v_flex()
                                     .flex_1()
                                     .min_w_0()
+                                    .gap(px(2.))
                                     .child(div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).child(manifest.name.clone()))
-                                    .child(div().text_size(px(11.)).text_color(palette.secondary).child(meta))
-                                    .child(div().text_size(px(11.)).text_color(palette.tertiary).child(manifest.created_at.clone())),
+                                    .child(div().text_size(px(11.)).text_color(palette.secondary).child(format!("{meta} · {}", manifest.created_at))),
                             )
                             .child(
                                 Button::new(SharedString::from(format!("remove-layer-{index}")))
                                     .icon(IconName::Trash)
+                                    .label("移除")
                                     .ghost()
                                     .xsmall()
-                                    .tooltip("删除这个重建层")
                                     .on_click(cx.listener(move |this, _, window, cx| this.remove_layer(index, window, cx))),
                             )
-                    }))
-                    .child(div().text_size(px(11.)).text_color(palette.tertiary).child("在代码区切换到“Agent”查看；它是推断结果，不是证据。"))
-            }
-            .into_any_element(),
-        );
+                    })),
+                )
+            });
 
-        let integrity = section("包与完整性", &palette);
-        sections.push(
-            match self.loaded() {
-                None => integrity.child(v_flex().gap_2().child(Skeleton::new().h(px(12.)).w(px(140.))).child(Skeleton::new().h(px(10.)).w(px(200.)))),
-                Some(loaded) => {
-                    let worst = loaded.inspections.iter().map(|i| i.status).max_by_key(|s| integrity_rank(*s)).unwrap_or(Integrity::Valid);
-                    let (title, color, icon) = integrity_style(worst, &palette);
-                    let show_hashes = self.show_hashes;
-                    let copied = self.copied == Some("hashes");
-                    let all_hashes = loaded
-                        .inspections
-                        .iter()
-                        .filter_map(|i| Some(format!("{}  {}", i.sha256.clone()?, i.path.file_name()?.to_string_lossy())))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    integrity
-                        .child(h_flex().gap_1p5().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(color).child(icon).child(title))
-                        .children(loaded.inspections.iter().enumerate().map(|(index, inspection)| {
-                            let (_, color, icon) = integrity_style(inspection.status, &palette);
-                            let name = inspection.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                            let entries = inspection.entry_count.map(|n| format!(" · {n} 项")).unwrap_or_default();
-                            v_flex()
-                                .gap(px(2.))
-                                .child(
-                                    h_flex()
-                                        .gap_1p5()
-                                        .child(div().text_size(px(10.)).text_color(color).child(icon))
-                                        .child(div().flex_1().min_w_0().truncate().text_size(px(11.)).font_weight(FontWeight::MEDIUM).font_family(ui::mono_font()).child(name))
-                                        .child(div().text_size(px(10.5)).text_color(palette.tertiary).child(if index == 0 { "主包" } else { "分包" })),
-                                )
-                                .child(div().text_size(px(11.)).text_color(palette.secondary).child(format!("{}{entries}", format_size(inspection.file_size))))
-                                .when(show_hashes, |this| {
-                                    this.when_some(inspection.sha256.clone(), |this, sha| {
-                                        this.child(div().truncate().text_size(px(10.)).font_family(ui::mono_font()).text_color(palette.tertiary).child(sha))
-                                    })
-                                })
-                        }))
-                        .child(
-                            h_flex()
-                                .gap_1p5()
-                                .child(
-                                    Button::new("toggle-hashes")
-                                        .icon(if show_hashes { IconName::ChevronDown } else { IconName::ChevronRight })
-                                        .label("SHA-256 指纹")
-                                        .ghost()
-                                        .xsmall()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.show_hashes = !this.show_hashes;
-                                            cx.notify();
-                                        })),
-                                )
-                                .when(show_hashes, |this| {
-                                    this.child(
+        // Card 3: Package Integrity & SHA-256 Fingerprints
+        let integrity_card = match self.loaded() {
+            None => ui::card(&palette).p_4().gap_2().child(Skeleton::new().h(px(12.)).w(px(180.))).child(Skeleton::new().h(px(10.)).w(px(260.))),
+            Some(loaded) => {
+                let worst = loaded.inspections.iter().map(|i| i.status).max_by_key(|s| integrity_rank(*s)).unwrap_or(Integrity::Valid);
+                let (title, color, icon) = integrity_style(worst, &palette);
+                let copied = self.copied == Some("hashes");
+                let all_hashes = loaded
+                    .inspections
+                    .iter()
+                    .filter_map(|i| Some(format!("{}  {}", i.sha256.clone()?, i.path.file_name()?.to_string_lossy())))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let format_name = loaded.set.sources.first().map(|s| s.archive.format.as_str().to_string()).unwrap_or_else(|| "未知".into());
+
+                ui::card(&palette)
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(color)
+                                    .child(icon)
+                                    .child(format!("{title} · 格式 {format_name}")),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        Button::new("agent-reveal-dir")
+                                            .icon(IconName::FolderOpen)
+                                            .label(wxlocated_engine::platform::file_manager_name())
+                                            .xsmall()
+                                            .ghost()
+                                            .on_click(move |_, _, cx| cx.reveal_path(&folder)),
+                                    )
+                                    .child(
+                                        Button::new("agent-copy-dir")
+                                            .icon(IconName::Copy)
+                                            .label("复制缓存目录")
+                                            .xsmall()
+                                            .ghost()
+                                            .on_click(move |_, _, cx| ui::copy(folder_copy.clone(), cx)),
+                                    )
+                                    .child(
                                         Button::new("copy-hashes")
                                             .icon(if copied { IconName::Check } else { IconName::Hash })
-                                            .label(if copied { "已复制" } else { "复制全部" })
+                                            .label(if copied { "已复制全部 SHA-256" } else { "复制全部 SHA-256" })
                                             .xsmall()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 ui::copy(all_hashes.clone(), cx);
                                                 this.mark_copied("hashes", cx);
                                             })),
-                                    )
-                                }),
-                        )
-                }
+                                    ),
+                            ),
+                    )
+                    .child(div().text_size(px(11.5)).font_family(ui::mono_font()).text_color(palette.secondary).child(format!(
+                        "目录：{folder_display} · 修改于 {}",
+                        format_time(self.app.modified)
+                    )))
+                    .child(
+                        v_flex().gap_1p5().children(loaded.inspections.iter().enumerate().map(|(index, inspection)| {
+                            let (_, color, icon) = integrity_style(inspection.status, &palette);
+                            let name = inspection.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            let entries = inspection.entry_count.map(|n| format!(" · {n} 项")).unwrap_or_default();
+                            v_flex()
+                                .p_2p5()
+                                .gap_1()
+                                .rounded(px(8.))
+                                .bg(palette.fill)
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().text_size(px(11.)).text_color(color).child(icon))
+                                        .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).font_weight(FontWeight::MEDIUM).font_family(ui::mono_font()).child(name))
+                                        .child(badge(if index == 0 { "主包" } else { "分包" }, palette.secondary))
+                                        .child(div().text_size(px(11.)).text_color(palette.secondary).child(format!("{}{entries}", format_size(inspection.file_size)))),
+                                )
+                                .when_some(inspection.sha256.clone(), |this, sha| {
+                                    this.child(div().truncate().text_size(px(10.5)).font_family(ui::mono_font()).text_color(palette.tertiary).child(format!("SHA-256: {sha}")))
+                                })
+                        })),
+                    )
             }
-            .into_any_element(),
-        );
+        };
 
         div()
-            .id("inspector")
-            .w(px(width))
+            .id("agent-tab")
+            .flex_1()
             .h_full()
-            .flex_none()
             .overflow_y_scroll()
-            .bg(palette.sidebar)
-            .border_l_1()
-            .border_color(palette.hairline)
-            .child(v_flex().p_4().gap(px(22.)).children(sections))
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(920.))
+                    .mx_auto()
+                    .px_8()
+                    .py_6()
+                    .gap_5()
+                    .child(v_flex().gap_2().child(section_label("Agent 审计交付", None, &palette)).child(handoff_card))
+                    .child(v_flex().gap_2().child(section_label("语义重建层与对照", None, &palette)).child(layers_card))
+                    .child(v_flex().gap_2().child(section_label("原始包完整性与 SHA-256 证据指纹", None, &palette)).child(integrity_card)),
+            )
+            .into_any_element()
     }
 }
 
-fn evidence_method(value: &Value) -> &'static str {
+pub(super) fn evidence_method(value: &Value) -> &'static str {
     match value["match"]["method"].as_str() {
         Some("identical") => "原样对应",
         Some("anchored") => "文本定位",
@@ -373,7 +349,11 @@ fn evidence_method(value: &Value) -> &'static str {
 pub(super) fn build_evidence(loaded: &Loaded, index: usize, view: View, reading: &str, line: Option<i64>, verify: bool) -> Result<Value, String> {
     let artifact = &loaded.result.artifacts[index];
     let source = artifact.sources.first().ok_or("这个文件没有可追溯的原始来源")?;
-    let entry = loaded.set.entries.iter().find(|entry| entry.path == source.entry_path && loaded.set.source_title(entry) == source.package)
+    let entry = loaded
+        .set
+        .entries
+        .iter()
+        .find(|entry| entry.path == source.entry_path && loaded.set.source_title(entry) == source.package)
         .ok_or("找不到对应的原始条目，请重新重建")?;
     let archive = &loaded.set.sources[entry.source].archive;
     let inspection = loaded.inspections.iter().find(|inspection| inspection.path == archive.path).ok_or("没有原始包指纹，请重新重建")?;
@@ -387,7 +367,9 @@ pub(super) fn build_evidence(loaded: &Loaded, index: usize, view: View, reading:
     } else {
         std::borrow::Cow::Owned(loaded.set.read_limited(entry, wxlocated_engine::decompile::MAXIMUM_TEXT_FILE_SIZE).map_err(|error| error.to_string())?)
     };
-    let segment = if identical { 0..bytes.len() } else {
+    let segment = if identical {
+        0..bytes.len()
+    } else {
         std::str::from_utf8(&bytes).ok().and_then(|raw| source_span(artifact, raw)).unwrap_or(0..bytes.len())
     };
     let located = wxlocated_engine::trace::locate_entry(&bytes, reading, line, segment.clone(), identical, 120);
@@ -430,7 +412,6 @@ fn integrity_style(status: Integrity, palette: &Palette) -> (&'static str, Hsla,
 pub(super) fn source_span(artifact: &Artifact, raw: &str) -> Option<std::ops::Range<usize>> {
     let source = artifact.sources.first()?;
     let (start, end) = (source.start?, source.end?);
-    // The restorers saw the text without a BOM; the editor shows it with one.
     let text = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
     let bom = raw.len() - text.len();
     let span = if source.entry_path.to_lowercase().ends_with(".html") {
@@ -447,8 +428,8 @@ pub(super) fn source_span(artifact: &Artifact, raw: &str) -> Option<std::ops::Ra
 
 #[cfg(test)]
 mod tests {
-    use super::{Artifact, Confidence, Content, source_span};
-    use wxlocated_engine::decompile::{ArtifactKind, SourceRef};
+    use super::{Artifact, Content, source_span};
+    use wxlocated_engine::decompile::{ArtifactKind, Confidence, SourceRef};
 
     fn artifact(entry: &str, start: usize, end: usize) -> Artifact {
         Artifact {

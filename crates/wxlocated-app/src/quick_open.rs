@@ -84,7 +84,7 @@ impl QuickOpen {
         if let Some(app) = results.get(self.selected).or(results.first()) {
             let id = app.app_id.clone();
             Library::global(cx).update(cx, |library, cx| library.record_use(&id, cx));
-            crate::workspace::open_app_window(&id, cx);
+            crate::open_app(&id, cx);
             window.remove_window();
         }
     }
@@ -146,7 +146,7 @@ impl Render for QuickOpen {
                     .when(selected, |this| this.aria_active_descendant())
                     .on_a11y_action(AccessibleAction::Click, move |_, window, cx| {
                         Library::global(cx).update(cx, |library, cx| library.record_use(&id, cx));
-                        crate::workspace::open_app_window(&id, cx);
+                        crate::open_app(&id, cx);
                         window.remove_window();
                     })
                     .gap(px(10.))
@@ -166,13 +166,9 @@ impl Render for QuickOpen {
                             .child(div().text_size(px(10.5)).font_family(ui::mono_font()).text_color(palette.secondary).child(app.app_id.clone())),
                     )
                     .when_some(material, |this, text| this.child(badge(text, palette.warning)))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.selected = index;
-                        this.focus.focus(window, cx);
-                        cx.notify();
-                        if event.click_count() >= 2 {
-                            this.open_selected(window, cx);
-                        }
+                        this.open_selected(window, cx);
                     }))
                     .into_any_element()
             })
@@ -190,6 +186,7 @@ impl Render for QuickOpen {
                     h_flex()
                         .w_full()
                         .h_full()
+                        .when(!cfg!(target_os = "macos"), |this| this.pr(px(10.)))
                         .gap_2()
                         .child(div().text_size(px(16.)).text_color(palette.accent).child(IconName::Search))
                         .child(div().flex_1().child(Input::new(&self.query).aria_label("按名称或 AppID 搜索小程序").appearance(false).text_size(px(17.)))),

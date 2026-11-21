@@ -28,6 +28,23 @@ fn file_path(value: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("无法读取文件地址：{value}。请打开本机 .wxapkg 文件或含 overlay.json 的文件夹。"))
 }
 
+/// Lets the user choose local `.wxapkg` files, package folders, or overlay folders.
+pub fn prompt_open(cx: &mut App) {
+    let paths = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: true,
+        multiple: true,
+        prompt: Some("打开".into()),
+    });
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(paths))) = paths.await else { return };
+        if !paths.is_empty() {
+            cx.update(|cx| open_paths(&paths, cx));
+        }
+    })
+    .detach();
+}
+
 /// Overlay folders never fall through to package scanning. Multiple overlay
 /// folders and package files in the same drop are each forwarded to their owner.
 pub fn open_paths(paths: &[PathBuf], cx: &mut App) {
@@ -56,7 +73,7 @@ pub fn open_paths(paths: &[PathBuf], cx: &mut App) {
             id
         });
         if let Some(id) = id {
-            crate::workspace::open_app_window(&id, cx);
+            crate::open_app(&id, cx);
         } else {
             let names = packages.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join("、");
             report_error(format!("{names} 中没有可读取的 .wxapkg 包。包目录应直接包含 .wxapkg 文件；重建层目录应包含 overlay.json。"), cx);
@@ -70,7 +87,7 @@ pub fn open_paths(paths: &[PathBuf], cx: &mut App) {
 pub fn report_error(message: impl Into<SharedString>, cx: &mut App) {
     crate::focus_gallery(cx);
     let message = message.into();
-    if let Some(handle) = cx.try_global::<crate::GalleryWindow>().map(|window| window.0) {
+    if let Some(handle) = crate::main_window(cx) {
         handle.update(cx, |_, window, cx| {
             window.push_notification(Notification::error(message).title("无法打开"), cx);
         }).ok();

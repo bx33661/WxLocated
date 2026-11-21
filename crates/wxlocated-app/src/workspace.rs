@@ -1,24 +1,24 @@
-//! One window per mini program: the rebuilt source as a file tree; a code
-//! view that switches between the rebuild, the raw package bytes and any
-//! Agent semantic layer; an overview of the material; and an inspector.
+//! Mini program workspace: code reader (with page 4-file companion switcher,
+//! directory tree and `⇧⌘F` global search), subpackage monitor, and Agent
+//! handoff / forensic evidence view. Can live embedded inside `AppShell` or in
+//! a standalone window ("在新窗口中打开").
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::diff::DiffMode;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tree::TreeState;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 use serde_json::Value;
 use wxlocated_engine::archive::{Archive, PackageSet};
-#[cfg(all(feature = "snapshot", target_os = "macos"))]
-use wxlocated_engine::decompile::Artifact;
-use wxlocated_engine::decompile::{Confidence, Decompilation, decompile_reporting};
-use wxlocated_engine::material::report::{self, Analysis, Inspection, ReportInput};
+use wxlocated_engine::decompile::{Artifact, ArtifactKind, Confidence, Content, Decompilation, decompile_reporting};
 use wxlocated_engine::material::Context as MaterialContext;
+use wxlocated_engine::material::report::{self, Analysis, Inspection, ReportInput};
 use wxlocated_engine::overlay::{self, Layer as OverlayLayer};
 use wxlocated_engine::scan::Miniapp;
 
@@ -29,20 +29,47 @@ mod inspector;
 mod layout;
 mod overview;
 mod preview;
+mod search;
 
 use preview::{Preview, ReadingKey, ReadingState, View};
+use search::{SearchHit, SearchKindFilter};
 
-/// Everything the window shows, built once per package choice in the background.
-struct Loaded {
-    set: PackageSet,
-    result: Decompilation,
-    analysis: Analysis,
-    inspections: Vec<Inspection>,
-    report: Value,
-    seconds: f64,
-    summary: RebuildSummary,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkspaceTab {
+    Code,
+    Packages,
+    Agent,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BrowseMode {
+    Pages,
+    Tree,
+    Search,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TreeFilter {
+    All,
+    Script,
+    Markup,
+    Config,
+    Degraded,
+}
+
+/// Everything the workspace shows, built once per package choice off the UI thread.
+pub(super) struct Loaded {
+    pub(super) set: PackageSet,
+    pub(super) result: Decompilation,
+    pub(super) analysis: Analysis,
+    pub(super) inspections: Vec<Inspection>,
+    pub(super) report: Value,
+    pub(super) seconds: f64,
+    pub(super) summary: RebuildSummary,
     /// Artifact index by path.
-    index: HashMap<String, usize>,
+    pub(super) index: HashMap<String, usize>,
+    /// Page route -> `navigationBarTitleText` parsed from `<page>.json`.
+    pub(super) page_titles: HashMap<String, String>,
 }
 
 enum Phase {
@@ -51,8 +78,6 @@ enum Phase {
     Ready(Arc<Loaded>),
 }
 
-/// What the window reports while it loads: opening, checking, then each
-/// decompile stage in order (`Stage` as usize), then the report.
 const STEPS: &[&str] = &["读取包", "校验结构", "建立索引", "还原配置", "拆分脚本", "还原 WXS", "还原页面结构", "还原样式", "整理产物", "生成清单"];
 
 /// A package choice: everything together, or one `.wxapkg` on its own.
@@ -63,6 +88,10 @@ struct PackageChoice {
 
 pub struct Workspace {
     app: Miniapp,
+    embedded: bool,
+    tab: WorkspaceTab,
+    browse_mode: BrowseMode,
+    tree_filter: TreeFilter,
     packages: Vec<PackageChoice>,
     package: usize,
     phase: Phase,
@@ -72,12 +101,18 @@ pub struct Workspace {
     layers: Vec<OverlayLayer>,
     tree: Entity<TreeState>,
     filter: Entity<InputState>,
+    global_search: Entity<InputState>,
     focus: FocusHandle,
     tree_focus: FocusHandle,
-    /// Path of the selected artifact; `None` shows the overview.
+    /// Path of the active file in the code reader.
     selected: Option<String>,
+    open_tabs: Vec<String>,
+    history_back: Vec<String>,
+    history_forward: Vec<String>,
+    pending_jump_line: Option<u32>,
     view: View,
     compare: bool,
+    diff_mode: DiffMode,
     preview: Preview,
     /// Bumped per preview request; late results for older requests are dropped.
     preview_generation: u64,
@@ -89,18 +124,23 @@ pub struct Workspace {
     evidence: Option<Value>,
     copying_evidence: bool,
     agent_diff: Option<(usize, usize)>,
+    search_case_sensitive: bool,
+    search_kind: SearchKindFilter,
+    search_include_containers: bool,
+    search_generation: u64,
+    search_running: bool,
+    search_hits: Vec<SearchHit>,
+    search_matched_files: usize,
+    search_truncated: bool,
     pending_imports: VecDeque<PathBuf>,
     importing: bool,
-    show_inspector: bool,
     show_containers: bool,
-    show_hashes: bool,
-    /// Inspector sections folded by the user.
-    collapsed: std::collections::HashSet<&'static str>,
     copied: Option<&'static str>,
     _subscriptions: Vec<Subscription>,
 }
 
-/// Opens the app's window, or focuses it when it is already open.
+/// Opens the app in its own standalone window ("在新窗口中打开"), or focuses
+/// it if already open.
 pub fn open_app_window(app_id: &str, cx: &mut App) {
     let library = Library::global(cx);
     if let Some(handle) = library.read(cx).app_windows.get(app_id).copied()
@@ -110,11 +150,11 @@ pub fn open_app_window(app_id: &str, cx: &mut App) {
     }
     let Some(app) = library.read(cx).app(app_id).cloned() else { return };
     let title = format!("{} · {}", app.display_name(), app.app_id);
-    let options = crate::theme::window_options(&title, Bounds::centered(None, size(px(1320.), px(840.)), cx), Some(size(px(900.), px(560.))), 52.);
+    let options = crate::theme::window_options(&title, Bounds::centered(None, size(px(1240.), px(800.)), cx), Some(size(px(860.), px(540.))), 48.);
     let id = app.app_id.clone();
     if let Ok((handle, _)) = gpui_kit::open_window(options, cx, |window, cx| {
         crate::theme::follow_appearance(window, cx);
-        cx.new(|cx| Workspace::new(app, window, cx))
+        cx.new(|cx| Workspace::new(app, false, window, cx))
     }) {
         library.update(cx, |library, _| {
             library.app_windows.insert(id, handle);
@@ -126,7 +166,10 @@ pub fn open_app_window(app_id: &str, cx: &mut App) {
 pub fn open_overlay_folder(work: PathBuf, cx: &mut App) {
     let manifest = match overlay::read_manifest_strict(&work) {
         Ok(manifest) => manifest,
-        Err(error) => { crate::native_open::report_error(error.to_string(), cx); return; }
+        Err(error) => {
+            crate::native_open::report_error(error.to_string(), cx);
+            return;
+        }
     };
     let id = manifest.base.app_id;
     let library = Library::global(cx);
@@ -142,11 +185,15 @@ pub fn open_overlay_folder(work: PathBuf, cx: &mut App) {
                 cx.background_executor().timer(Duration::from_millis(100)).await;
             }
             cx.update(|cx| crate::native_open::report_error("缓存扫描尚未完成，请稍后重新打开重建层。", cx));
-        }).detach();
+        })
+        .detach();
         return;
     }
     if library.read(cx).app(&id).is_none() {
         crate::native_open::report_error(format!("本机没有 {id} 的基础包；请先打开对应小程序或原始包，再导入重建层。"), cx);
+        return;
+    }
+    if crate::open_overlay_in_shell(&id, work.clone(), cx) {
         return;
     }
     open_app_window(&id, cx);
@@ -154,25 +201,27 @@ pub fn open_overlay_folder(work: PathBuf, cx: &mut App) {
     if let Some(root) = handle.and_then(|handle| handle.downcast::<gpui_kit::base::Root>()) {
         root.update(cx, |root, window, cx| {
             if let Ok(workspace) = root.view().clone().downcast::<Workspace>() {
-                workspace.update(cx, |this, cx| {
-                    if !this.pending_imports.contains(&work) {
-                        this.pending_imports.push_back(work);
-                    }
-                    this.start_next_import(window, cx);
-                });
+                workspace.update(cx, |this, cx| this.enqueue_overlay(work, window, cx));
             }
-        }).ok();
+        })
+        .ok();
     }
 }
 
 impl Workspace {
-    fn new(app: Miniapp, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(app: Miniapp, embedded: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tree = cx.new(|cx| TreeState::new(cx));
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(ui::shortcut("筛选文件  ⇧⌘O")));
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(ui::shortcut("筛选文件名或路径  ⇧⌘O")));
+        let global_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索接口、字段、Token…"));
         let subscriptions = vec![
             cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.rebuild_tree(cx);
+                }
+            }),
+            cx.subscribe(&global_search, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
+                    this.trigger_global_search(cx);
                 }
             }),
             cx.observe_in(&tree, window, |this, tree, window, cx| {
@@ -191,12 +240,18 @@ impl Workspace {
         }
         for (index, path) in all.iter().enumerate() {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            packages.push(PackageChoice { title: format!("{} · {name}", if index == 0 { "主包" } else { "分包" }), path: (all.len() > 1).then(|| path.clone()) });
+            packages.push(PackageChoice {
+                title: format!("{} · {name}", if index == 0 { "主包" } else { "分包" }),
+                path: (all.len() > 1).then(|| path.clone()),
+            });
         }
         let focus = cx.focus_handle();
-        focus.focus(window, cx);
         let mut workspace = Self {
             app,
+            embedded,
+            tab: WorkspaceTab::Code,
+            browse_mode: BrowseMode::Pages,
+            tree_filter: TreeFilter::All,
             packages,
             package: 0,
             phase: Phase::Loading,
@@ -205,11 +260,17 @@ impl Workspace {
             layers: Vec::new(),
             tree,
             filter,
+            global_search,
             focus,
             tree_focus: cx.focus_handle(),
             selected: None,
+            open_tabs: Vec::new(),
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
+            pending_jump_line: None,
             view: View::Rebuilt,
             compare: false,
+            diff_mode: DiffMode::Unified,
             preview: Preview::None,
             preview_generation: 0,
             open_large: false,
@@ -219,17 +280,33 @@ impl Workspace {
             evidence: None,
             copying_evidence: false,
             agent_diff: None,
+            search_case_sensitive: false,
+            search_kind: SearchKindFilter::All,
+            search_include_containers: false,
+            search_generation: 0,
+            search_running: false,
+            search_hits: Vec::new(),
+            search_matched_files: 0,
+            search_truncated: false,
             pending_imports: VecDeque::new(),
             importing: false,
-            show_inspector: true,
             show_containers: false,
-            show_hashes: false,
-            collapsed: std::collections::HashSet::new(),
             copied: None,
             _subscriptions: subscriptions,
         };
         workspace.load(window, cx);
         workspace
+    }
+
+    pub fn matches_app(&self, app: &Miniapp) -> bool {
+        self.app.main_package == app.main_package && self.app.sub_packages == app.sub_packages && self.app.modified == app.modified
+    }
+
+    pub fn enqueue_overlay(&mut self, work: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pending_imports.contains(&work) {
+            self.pending_imports.push_back(work);
+        }
+        self.start_next_import(window, cx);
     }
 
     fn context(&self, cx: &App) -> MaterialContext {
@@ -298,7 +375,18 @@ impl Workspace {
                 summary.degraded += usize::from(artifact.confidence <= Confidence::Medium);
                 index.insert(artifact.path.clone(), position);
             }
-            Ok::<_, String>(Loaded { set, result, analysis, inspections, report, seconds, summary, index })
+            let mut page_titles = HashMap::new();
+            for page in &analysis.page_paths {
+                let json_path = format!("{page}.json");
+                if let Some(&position) = index.get(&json_path)
+                    && let Some(text) = read_artifact_text(&set, &result.artifacts[position])
+                    && let Ok(parsed) = serde_json::from_str::<Value>(&text)
+                    && let Some(title) = parsed["navigationBarTitleText"].as_str().map(str::trim).filter(|t| !t.is_empty())
+                {
+                    page_titles.insert(page.clone(), title.to_string());
+                }
+            }
+            Ok::<_, String>(Loaded { set, result, analysis, inspections, report, seconds, summary, index, page_titles })
         });
         cx.spawn_in(window, async move |this, cx| {
             let outcome = task.await;
@@ -309,6 +397,10 @@ impl Workspace {
                             let id = this.app.app_id.clone();
                             Library::global(cx).update(cx, |library, cx| library.record_rebuild(&id, loaded.summary, cx));
                         }
+                        this.open_tabs.retain(|path| loaded.index.contains_key(path));
+                        if loaded.analysis.page_paths.is_empty() && this.browse_mode == BrowseMode::Pages {
+                            this.browse_mode = BrowseMode::Tree;
+                        }
                         Phase::Ready(Arc::new(loaded))
                     }
                     Err(message) => Phase::Failed(message),
@@ -318,20 +410,49 @@ impl Workspace {
                 cx.notify();
             })
             .ok();
-            // Reopen the file that was showing when the window last closed.
             this.update_in(cx, |this, window, cx| {
                 let last = Library::global(cx).read(cx).settings.last_files.get(&this.app.app_id).cloned();
+                let initial = last.filter(|path| this.artifact(path).is_some()).or_else(|| this.default_initial_file());
                 if this.selected.is_none()
-                    && let Some(path) = last
-                    && this.artifact(&path).is_some()
+                    && let Some(path) = initial
                 {
                     this.select(Some(path), window, cx);
+                }
+                if !this.global_search.read(cx).value().trim().is_empty() {
+                    this.trigger_global_search(cx);
                 }
                 this.start_next_import(window, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    fn default_initial_file(&self) -> Option<String> {
+        let loaded = self.loaded()?;
+        for page in &loaded.analysis.page_paths {
+            for ext in ["js", "wxml", "json", "wxss"] {
+                let candidate = format!("{page}.{ext}");
+                if loaded.index.contains_key(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        for candidate in ["app.js", "app.json"] {
+            if loaded.index.contains_key(candidate) {
+                return Some(candidate.into());
+            }
+        }
+        loaded
+            .result
+            .artifacts
+            .iter()
+            .find(|a| {
+                !a.path.starts_with("__wxlocated_")
+                    && !matches!(a.kind, ArtifactKind::Image | ArtifactKind::Font | ArtifactKind::Media | ArtifactKind::Binary)
+            })
+            .or_else(|| loaded.result.artifacts.first())
+            .map(|a| a.path.clone())
     }
 
     fn loaded(&self) -> Option<Arc<Loaded>> {
@@ -366,6 +487,7 @@ impl Workspace {
             && index >= self.layers.len()
         {
             self.view = View::Rebuilt;
+            self.compare = false;
         }
     }
 
@@ -381,6 +503,7 @@ impl Workspace {
         self.reload_layers();
         if matches!(self.view, View::Agent(_)) {
             self.view = View::Rebuilt;
+            self.compare = false;
             self.refresh_preview(window, cx);
         }
         window.push_notification(Notification::info(format!("已删除 Agent 重建层「{name}」")), cx);
@@ -388,8 +511,12 @@ impl Workspace {
     }
 
     fn start_next_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.importing || self.pending_imports.is_empty() { return; }
-        if matches!(self.phase, Phase::Loading) { return; }
+        if self.importing || self.pending_imports.is_empty() {
+            return;
+        }
+        if matches!(self.phase, Phase::Loading) {
+            return;
+        }
         if self.loaded().is_none() {
             self.pending_imports.clear();
             window.push_notification(Notification::error("基础包无法读取，请重新打开有效的原始包后导入。"), cx);
@@ -413,18 +540,34 @@ impl Workspace {
                             this.compare = false;
                             this.refresh_preview(window, cx);
                         }
-                        window.push_notification(Notification::success(format!("已导入 Agent 重建层「{}」· {} 个文件", result.name, result.changed_files.len() + result.added_files.len())), cx);
+                        window.push_notification(
+                            Notification::success(format!("已导入 Agent 重建层「{}」· {} 个文件", result.name, result.changed_files.len() + result.added_files.len())),
+                            cx,
+                        );
                     }
                     Err(error) => window.push_notification(Notification::error(error.to_string()).title("无法导入重建层"), cx),
                 }
                 this.start_next_import(window, cx);
                 cx.notify();
-            }).ok();
-        }).detach();
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
-fn kind_title(kind: wxlocated_engine::decompile::ArtifactKind) -> &'static str {
+fn read_artifact_text(set: &PackageSet, artifact: &Artifact) -> Option<String> {
+    match &artifact.content {
+        Content::Generated(text) => Some(text.clone()),
+        Content::Entry(index) => {
+            let entry = set.entries.get(*index)?;
+            let bytes = set.read_limited(entry, 512 * 1024).ok()?;
+            String::from_utf8(bytes).ok()
+        }
+    }
+}
+
+fn kind_title(kind: ArtifactKind) -> &'static str {
     use wxlocated_engine::decompile::ArtifactKind::*;
     match kind {
         Configuration => "配置",
@@ -466,12 +609,20 @@ pub fn snapshot_step(handle: AnyWindowHandle, step: &str, cx: &mut AsyncApp) {
                 let pick = |predicate: &dyn Fn(&Artifact) -> bool| loaded.result.artifacts.iter().find(|a| predicate(a)).map(|a| a.path.clone());
                 match step.as_str() {
                     "file" => {
+                        this.tab = WorkspaceTab::Code;
                         let path = pick(&|a| a.path.ends_with(".wxml") && a.confidence == Confidence::High && a.content.generated_text().is_some_and(|t| t.len() > 400));
                         this.select(path, window, cx);
                     }
-                    "raw" => this.set_view(View::Raw, window, cx),
-                    "overview" => this.select(None, window, cx),
+                    "raw" => {
+                        this.tab = WorkspaceTab::Code;
+                        this.set_view(View::Raw, false, window, cx);
+                    }
+                    "overview" => {
+                        this.tab = WorkspaceTab::Packages;
+                        cx.notify();
+                    }
                     "image" => {
+                        this.tab = WorkspaceTab::Code;
                         let path = pick(&|a| a.path.ends_with(".png") && !a.path.starts_with("__"));
                         this.select(path, window, cx);
                     }

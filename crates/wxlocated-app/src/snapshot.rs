@@ -13,14 +13,15 @@ use gpui_kit::*;
 
 use crate::library::Library;
 
-pub fn schedule(gallery: AnyWindowHandle, gallery_view: Entity<crate::gallery::Gallery>, cx: &mut App) {
+pub fn schedule(main_window: AnyWindowHandle, shell: Entity<crate::shell::AppShell>, cx: &mut App) {
     let Some(directory) = std::env::var_os("WXLOCATED_SNAPSHOT").map(PathBuf::from) else { return };
     let app_id = std::env::var("WXLOCATED_SNAPSHOT_APP").ok();
+    let gallery_view = shell.read(cx).gallery_entity();
     let _ = std::fs::create_dir_all(&directory);
     cx.spawn(async move |cx| {
         let library = cx.update(|cx| Library::global(cx));
         cx.background_executor().timer(Duration::from_millis(60)).await;
-        capture(gallery, &directory.join("gallery-loading.png"), cx);
+        capture(main_window, &directory.join("gallery-loading.png"), cx);
         for _ in 0..600 {
             let ready = library.read_with(cx, |library, _| library.snapshot.is_some() && !library.scanning);
             if ready {
@@ -29,20 +30,20 @@ pub fn schedule(gallery: AnyWindowHandle, gallery_view: Entity<crate::gallery::G
             cx.background_executor().timer(Duration::from_millis(200)).await;
         }
         settle(cx).await;
-        capture(gallery, &directory.join("gallery.png"), cx);
+        capture(main_window, &directory.join("gallery.png"), cx);
 
         let first = app_id.clone().or_else(|| library.read_with(cx, |library, _| library.all_apps().first().map(|a| a.app_id.clone())));
-        if let Some(id) = first.clone() {
+        if let Some(id) = first {
             cx.update(|cx| {
-                gallery
+                main_window
                     .update(cx, |_, window, cx| gallery_view.update(cx, |gallery, cx| gallery.select_for_snapshot(&id, window, cx)))
                     .ok();
             });
             settle(cx).await;
-            capture(gallery, &directory.join("gallery-selected.png"), cx);
+            capture(main_window, &directory.join("gallery-selected.png"), cx);
             cx.update(|cx| gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx));
             settle(cx).await;
-            capture(gallery, &directory.join("gallery-dark.png"), cx);
+            capture(main_window, &directory.join("gallery-dark.png"), cx);
             cx.update(crate::theme::apply);
         }
         cx.update(|cx| crate::settings_view::open_settings(None, cx));

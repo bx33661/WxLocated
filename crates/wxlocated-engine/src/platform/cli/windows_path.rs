@@ -179,7 +179,7 @@ fn decode(value: Option<&RegValue<'_>>) -> io::Result<(Origin, String)> {
     if value.bytes.len() % 2 != 0 {
         return Err(invalid_value());
     }
-    let mut text: String = char::decode_utf16(value.bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])))
+    let mut text: String = char::decode_utf16(value.bytes.as_chunks::<2>().0.iter().copied().map(u16::from_le_bytes))
         .collect::<Result<_, _>>()
         .map_err(|_| invalid_value())?;
     text.truncate(text.trim_end_matches('\0').len());

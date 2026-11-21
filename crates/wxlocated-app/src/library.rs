@@ -218,6 +218,10 @@ impl Library {
         self.external.iter().find(|app| app.app_id == app_id).or_else(|| self.apps().iter().find(|app| app.app_id == app_id))
     }
 
+    pub fn is_external(&self, app_id: &str) -> bool {
+        self.external.iter().any(|app| app.app_id == app_id)
+    }
+
     pub fn record_use(&mut self, app_id: &str, cx: &mut Context<Self>) {
         if self.settings.recent_app_ids.first().map(String::as_str) == Some(app_id) {
             return;

@@ -3,7 +3,7 @@
 # and a disk image, with SHA-256 sums. Signs and notarizes when the
 # identities are given; otherwise the app is signed ad hoc.
 #
-#   VERSION=1.1.0 scripts/build-release.sh
+#   VERSION=1.2.0 scripts/build-release.sh
 #   DEVELOPER_ID_APPLICATION="Developer ID Application: …" \
 #   DEVELOPER_ID_INSTALLER="Developer ID Installer: …" \
 #   NOTARY_KEYCHAIN_PROFILE=wxlocated scripts/build-release.sh
@@ -43,6 +43,7 @@ for arch in arm64 x86_64; do
   }
 done
 codesign --verify --deep --strict --verbose=2 "$APP"
+python3 "$ROOT/scripts/smoke-cli.py" --cli "$APP/Contents/Helpers/wxlocated"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$APP_ARCHIVE"
 

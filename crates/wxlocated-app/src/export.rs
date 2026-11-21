@@ -3,6 +3,7 @@
 //! the background; the outcome arrives as a toast with a "show" action.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -11,6 +12,7 @@ use gpui_kit::*;
 use wxlocated_engine::material::Context as MaterialContext;
 use wxlocated_engine::material::export::{Options, export};
 use wxlocated_engine::scan::Miniapp;
+use wxlocated_engine::settings::ExportRecord;
 use crate::library::Library;
 
 /// One toast slot per window for export progress and results.
@@ -36,12 +38,38 @@ pub fn failed(message: impl Into<SharedString>, window: &mut Window, cx: &mut Ap
     window.push_notification(Notification::error(message).title("导出失败").id::<ExportNote>(), cx);
 }
 
-/// Exports audit material to the default folder, or asks for one.
-pub fn export_material<V: 'static>(app: Miniapp, context: MaterialContext, window: &mut Window, cx: &mut Context<V>) {
-    start_material_export(app, context, false, window, cx);
+/// Concise instruction prompt ready to paste into Claude Code / Cursor / Codex.
+pub fn agent_prompt(app_name: &str, app_id: &str, root: &Path) -> String {
+    format!(
+        "请对微信小程序「{app_name}」（AppID: {app_id}）进行安全与代码审计。\n\
+         审计材料目录：{}\n\
+         要求：\n\
+         1. 先阅读目录下的 AGENT.md 与 material.json，确认分包/插件完整度。\n\
+         2. 基于 source/ 浏览还原代码结构、接口请求、鉴权流程与敏感配置。\n\
+         3. 引用任何发现或证据行前，使用 `wxlocated trace \"{}\" <文件路径:行号>` 对照 raw/ 原始字节核对偏移。",
+        root.display(),
+        root.display()
+    )
 }
 
-fn start_material_export(app: Miniapp, context: MaterialContext, choose_directory: bool, window: &mut Window, cx: &mut App) {
+/// Exports audit material to the default folder, or asks for one.
+pub fn export_material<V: 'static>(app: Miniapp, context: MaterialContext, window: &mut Window, cx: &mut Context<V>) {
+    start_material_export(app, context, false, false, window, cx);
+}
+
+/// Exports audit material and copies an Agent audit prompt to the clipboard upon completion.
+pub fn export_and_copy_prompt<V: 'static>(app: Miniapp, context: MaterialContext, window: &mut Window, cx: &mut Context<V>) {
+    start_material_export(app, context, false, true, window, cx);
+}
+
+fn start_material_export(
+    app: Miniapp,
+    context: MaterialContext,
+    choose_directory: bool,
+    copy_prompt: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let settings = Library::global(cx).read(cx).settings.clone();
     let fixed = (!choose_directory).then(|| settings.export_directory.clone().map(PathBuf::from)).flatten().filter(|p| p.is_dir());
     let paths = fixed.is_none().then(|| {
@@ -65,6 +93,7 @@ fn start_material_export(app: Miniapp, context: MaterialContext, choose_director
             include_raw: settings.export_include_raw,
             include_source: settings.export_include_source,
         };
+        let record_app = app.clone();
         let retry_app = app.clone();
         let retry_context = context.clone();
         let task = cx.background_executor().spawn(async move {
@@ -74,7 +103,26 @@ fn start_material_export(app: Miniapp, context: MaterialContext, choose_director
         });
         let outcome = task.await;
         cx.update(|cx| handle.update(cx, |_, window, cx| match outcome {
-            Ok((root, summary)) => material_done(summary, root, window, cx),
+            Ok((root, summary)) => {
+                let exported_at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let prompt_text = agent_prompt(record_app.display_name(), &record_app.app_id, &root);
+                if crate::library::persists() {
+                    Library::global(cx).update(cx, |library, cx| {
+                        library.settings.record_export(ExportRecord {
+                            app_id: record_app.app_id.clone(),
+                            name: record_app.display_name().to_string(),
+                            version: record_app.version.clone(),
+                            root: root.to_string_lossy().into_owned(),
+                            exported_at,
+                        });
+                        library.save_settings(cx);
+                    });
+                }
+                if copy_prompt {
+                    crate::ui::copy(prompt_text.clone(), cx);
+                }
+                material_done(summary, root, prompt_text, copy_prompt, window, cx);
+            }
             Err(message) => {
                 window.push_notification(Notification::error(message).title("导出失败，已有材料未被覆盖")
                     .id::<ExportNote>().autohide(false)
@@ -82,7 +130,7 @@ fn start_material_export(app: Miniapp, context: MaterialContext, choose_director
                         let app = retry_app.clone();
                         let context = retry_context.clone();
                         Button::new("retry-material-folder").label("选择其他目录…").ghost()
-                            .on_click(move |_, window, cx| start_material_export(app.clone(), context.clone(), true, window, cx))
+                            .on_click(move |_, window, cx| start_material_export(app.clone(), context.clone(), true, copy_prompt, window, cx))
                     }), cx);
             }
         }))
@@ -91,16 +139,19 @@ fn start_material_export(app: Miniapp, context: MaterialContext, choose_director
     .detach();
 }
 
-fn material_done(summary: String, root: PathBuf, window: &mut Window, cx: &mut App) {
-    window.push_notification(Notification::new().with_type(NotificationType::Success).title("审计材料").id::<ExportNote>().autohide(false)
+fn material_done(summary: String, root: PathBuf, prompt_text: String, copied_prompt: bool, window: &mut Window, cx: &mut App) {
+    let title = if copied_prompt { "审计材料已导出并复制 Agent 提示词" } else { "审计材料" };
+    window.push_notification(Notification::new().with_type(NotificationType::Success).title(title).id::<ExportNote>().autohide(false)
         .content(move |_, _, _| {
             let open = root.clone();
-            let copy = root.clone();
+            let copy_path = root.clone();
+            let copy_prompt = prompt_text.clone();
             gpui_kit::base::v_flex().gap_2()
                 .child(gpui_kit::div().id("material-summary").role(Role::Status).aria_label(summary.clone()).child(summary.clone()))
-                .child(gpui_kit::base::h_flex().gap_1()
+                .child(gpui_kit::base::h_flex().flex_wrap().gap_1()
                     .child(Button::new("open-material").label("打开目录").ghost().on_click(move |_, _, cx| cx.open_with_system(&open)))
-                    .child(Button::new("copy-material-path").label("复制材料路径").ghost().on_click(move |_, _, cx| crate::ui::copy(copy.to_string_lossy(), cx))))
+                    .child(Button::new("copy-material-prompt").label("复制 Agent 提示词").ghost().on_click(move |_, _, cx| crate::ui::copy(copy_prompt.clone(), cx)))
+                    .child(Button::new("copy-material-path").label("复制路径").ghost().on_click(move |_, _, cx| crate::ui::copy(copy_path.to_string_lossy(), cx))))
                 .into_any_element()
         }), cx);
 }

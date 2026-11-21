@@ -9,17 +9,20 @@ mod library;
 mod native_open;
 mod quick_open;
 mod settings_view;
+mod shell;
 #[cfg(all(feature = "snapshot", target_os = "macos"))]
 mod snapshot;
 mod theme;
 mod ui;
 mod workspace;
 
+use std::path::PathBuf;
+
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, Search, SelectAll, Undo};
 use gpui_kit::*;
 
-use crate::gallery::Gallery;
 use crate::library::Library;
+use crate::shell::AppShell;
 
 actions!(
     wxlocated,
@@ -29,6 +32,7 @@ actions!(
         OpenSettings,
         Refresh,
         QuickOpen,
+        OpenLocalPackage,
         ShowGallery,
         HideApp,
         CloseWindow,
@@ -40,51 +44,104 @@ actions!(
     ]
 );
 
-/// Actions the frontmost app window handles; greyed out elsewhere.
+/// Actions the active miniapp workspace handles; greyed out elsewhere.
 pub mod workspace_actions {
-    gpui_kit::actions!(workspace, [ExportMaterial, ShowOverview, ToggleRaw, ToggleInspector, BackToGallery, Rebuild, FocusFilter]);
+    gpui_kit::actions!(
+        workspace,
+        [ExportMaterial, ShowOverview, ToggleRaw, ToggleInspector, BackToGallery, Rebuild, FocusFilter, FocusGlobalSearch]
+    );
 }
 
-/// The gallery window, to bring back from an app window.
-struct GalleryWindow(AnyWindowHandle);
+#[derive(Clone)]
+struct MainWindow(AnyWindowHandle, Entity<AppShell>);
 
-impl Global for GalleryWindow {}
+impl Global for MainWindow {}
+
+pub fn main_window(cx: &App) -> Option<AnyWindowHandle> {
+    cx.try_global::<MainWindow>().map(|w| w.0)
+}
 
 pub fn focus_gallery(cx: &mut App) {
-    if let Some(handle) = cx.try_global::<GalleryWindow>().map(|g| g.0)
+    if let Some(handle) = main_window(cx)
         && handle.update(cx, |_, window, _| window.activate_window()).is_ok()
     {
         return;
     }
-    open_gallery(cx);
+    open_main_window(cx);
 }
 
-fn open_gallery(cx: &mut App) {
+pub fn show_home_in_shell(cx: &mut App) {
+    if let Some(MainWindow(handle, shell)) = cx.try_global::<MainWindow>().cloned()
+        && handle
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                shell.update(cx, |shell, cx| shell.show_home(cx));
+            })
+            .is_ok()
+    {
+        return;
+    }
+    focus_gallery(cx);
+}
+
+/// Opens a mini program inside the unified main shell window, or falls back to
+/// a standalone workspace window if no shell window is alive.
+pub fn open_app(app_id: &str, cx: &mut App) {
+    if let Some(MainWindow(handle, shell)) = cx.try_global::<MainWindow>().cloned()
+        && let Ok(Some(_)) = handle.update(cx, |_, window, cx| {
+            window.activate_window();
+            shell.update(cx, |shell, cx| shell.open_app(app_id, window, cx))
+        })
+    {
+        return;
+    }
+    workspace::open_app_window(app_id, cx);
+}
+
+/// Routes an overlay folder import into the unified shell when present.
+pub fn open_overlay_in_shell(app_id: &str, work: PathBuf, cx: &mut App) -> bool {
+    if let Some(MainWindow(handle, shell)) = cx.try_global::<MainWindow>().cloned()
+        && let Ok(true) = handle.update(cx, |_, window, cx| {
+            window.activate_window();
+            if let Some(ws) = shell.update(cx, |shell, cx| shell.open_app(app_id, window, cx)) {
+                ws.update(cx, |ws, cx| ws.enqueue_overlay(work, window, cx));
+                true
+            } else {
+                false
+            }
+        })
+    {
+        return true;
+    }
+    false
+}
+
+fn open_main_window(cx: &mut App) {
     let focus = std::env::var_os("WXLOCATED_NO_FOCUS").is_none();
-    let options = theme::window_options("WxLocated", gallery_bounds(cx), Some(size(px(820.), px(560.))), 60.);
-    let Ok((window, gallery)) = gpui_kit::open_window(options, cx, |window, cx| {
+    let options = theme::window_options("WxLocated", main_bounds(cx), Some(size(px(920.), px(600.))), 48.);
+    let Ok((window, shell)) = gpui_kit::open_window(options, cx, |window, cx| {
         theme::follow_appearance(window, cx);
-        cx.new(|cx| Gallery::new(window, cx))
+        cx.new(|cx| AppShell::new(window, cx))
     }) else {
         return;
     };
-    cx.set_global(GalleryWindow(window));
+    cx.set_global(MainWindow(window, shell.clone()));
     #[cfg(all(feature = "snapshot", target_os = "macos"))]
-    snapshot::schedule(window, gallery, cx);
+    snapshot::schedule(window, shell, cx);
     #[cfg(not(all(feature = "snapshot", target_os = "macos")))]
-    let _ = gallery;
+    let _ = shell;
     if focus {
         cx.activate(true);
     }
 }
 
-/// The gallery's last frame when it still lies on a connected display,
+/// The main window's last frame when it still lies on a connected display,
 /// otherwise a centered default.
-fn gallery_bounds(cx: &App) -> Bounds<Pixels> {
+fn main_bounds(cx: &App) -> Bounds<Pixels> {
     let saved = Library::global(cx).read(cx).settings.gallery_frame;
     if let Some([x, y, width, height]) = saved
-        && width >= 820.
-        && height >= 560.
+        && width >= 920.
+        && height >= 600.
     {
         let bounds = Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
         let center = bounds.center();
@@ -92,7 +149,7 @@ fn gallery_bounds(cx: &App) -> Bounds<Pixels> {
             return bounds;
         }
     }
-    Bounds::centered(None, size(px(1180.), px(780.)), cx)
+    Bounds::centered(None, size(px(1280.), px(820.)), cx)
 }
 
 fn main() {
@@ -108,13 +165,13 @@ fn main() {
         Library::init(cx);
         theme::init(cx);
         bind(cx);
-        // Panel widths and the gallery frame change often; write them once, on quit.
+        // Panel widths and the window frame change often; write them once on quit.
         cx.on_app_quit(|cx| {
             Library::global(cx).update(cx, |library, cx| library.save_settings(cx));
             async {}
         })
         .detach();
-        open_gallery(cx);
+        open_main_window(cx);
         #[cfg(not(target_os = "macos"))]
         {
             let paths: Vec<_> = std::env::args_os().skip(1).map(std::path::PathBuf::from).collect();
@@ -122,8 +179,11 @@ fn main() {
                 native_open::open_paths(&paths, cx);
             }
             cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() { cx.quit(); }
-            }).detach();
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
         }
         cx.spawn(async move |cx| {
             while let Ok(paths) = received.recv().await {
@@ -134,7 +194,6 @@ fn main() {
     });
 }
 
-
 fn bind(cx: &mut App) {
     use workspace_actions::*;
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -143,7 +202,8 @@ fn bind(cx: &mut App) {
     cx.on_action(|_: &OpenSettings, cx| settings_view::open_settings(None, cx));
     cx.on_action(|_: &About, cx| settings_view::open_settings(Some(settings_view::Tab::About), cx));
     cx.on_action(|_: &QuickOpen, cx| quick_open::open(cx));
-    cx.on_action(|_: &ShowGallery, cx| focus_gallery(cx));
+    cx.on_action(|_: &OpenLocalPackage, cx| native_open::prompt_open(cx));
+    cx.on_action(|_: &ShowGallery, cx| show_home_in_shell(cx));
     cx.on_action(|_: &OpenContract, cx| cx.open_url("https://github.com/bx33661/WxLocated#cli"));
     cx.on_action(|_: &OpenRepository, cx| cx.open_url("https://github.com/bx33661/WxLocated"));
     cx.on_action(|_: &CloseWindow, cx| {
@@ -168,6 +228,8 @@ fn bind(cx: &mut App) {
         KeyBinding::new(key("cmd-r", "ctrl-r"), Refresh, None),
         KeyBinding::new(key("cmd-,", "ctrl-,"), OpenSettings, None),
         KeyBinding::new(key("cmd-o", "ctrl-o"), QuickOpen, None),
+        KeyBinding::new(key("cmd-k", "ctrl-k"), QuickOpen, None),
+        KeyBinding::new(key("alt-cmd-o", "alt-ctrl-o"), OpenLocalPackage, None),
         KeyBinding::new(key("cmd-shift-1", "ctrl-shift-1"), ShowGallery, None),
         KeyBinding::new(key("cmd-w", "ctrl-w"), CloseWindow, None),
         KeyBinding::new(key("cmd-m", "ctrl-m"), Minimize, None),
@@ -177,6 +239,7 @@ fn bind(cx: &mut App) {
         KeyBinding::new(key("alt-cmd-0", "alt-ctrl-0"), ToggleInspector, Some("Workspace")),
         KeyBinding::new(key("cmd-[", "ctrl-["), BackToGallery, Some("Workspace")),
         KeyBinding::new(key("cmd-shift-o", "ctrl-shift-o"), FocusFilter, Some("Workspace")),
+        KeyBinding::new(key("cmd-shift-f", "ctrl-shift-f"), FocusGlobalSearch, Some("Workspace")),
         KeyBinding::new(key("cmd-f", "ctrl-f"), FocusSearch, Some("Gallery")),
     ]);
     #[cfg(target_os = "macos")]
@@ -201,7 +264,8 @@ fn bind(cx: &mut App) {
             disabled: false,
             items: vec![
                 MenuItem::action("打开小程序…", QuickOpen),
-                MenuItem::action("显示画廊", ShowGallery),
+                MenuItem::action("打开本地包或重建层…", OpenLocalPackage),
+                MenuItem::action("微信实时缓存", ShowGallery),
                 MenuItem::separator(),
                 MenuItem::action("导出审计材料…", ExportMaterial),
                 MenuItem::separator(),
@@ -221,7 +285,8 @@ fn bind(cx: &mut App) {
                 MenuItem::action("全选", SelectAll),
                 MenuItem::separator(),
                 MenuItem::action("查找…", Search),
-                MenuItem::action("筛选文件", FocusFilter),
+                MenuItem::action("全局搜索源码…", FocusGlobalSearch),
+                MenuItem::action("筛选页面 / 文件", FocusFilter),
             ],
         },
         Menu {
@@ -230,12 +295,12 @@ fn bind(cx: &mut App) {
             items: vec![
                 MenuItem::action("重新扫描", Refresh),
                 MenuItem::separator(),
-                MenuItem::action("概要", ShowOverview),
-                MenuItem::action("切换原始 / 重建", ToggleRaw),
-                MenuItem::action("显示或隐藏检查器", ToggleInspector),
-                MenuItem::action("重新重建源码", Rebuild),
+                MenuItem::action("分包监控", ShowOverview),
+                MenuItem::action("切换原始 / 还原源码", ToggleRaw),
+                MenuItem::action("Agent 交付与证据", ToggleInspector),
+                MenuItem::action("重新分析当前包", Rebuild),
                 MenuItem::separator(),
-                MenuItem::action("返回画廊", BackToGallery),
+                MenuItem::action("返回微信实时缓存", BackToGallery),
             ],
         },
         Menu {

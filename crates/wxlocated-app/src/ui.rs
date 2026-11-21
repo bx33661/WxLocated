@@ -100,7 +100,7 @@ pub fn info_row(label: impl Into<SharedString>, value: impl Into<SharedString>, 
 
 /// Rounded group background for cards in content areas.
 pub fn card(palette: &Palette) -> Div {
-    v_flex().w_full().rounded(px(12.)).bg(palette.fill).border_1().border_color(palette.hairline)
+    v_flex().w_full().rounded(px(10.)).bg(palette.raised).border_1().border_color(palette.hairline)
 }
 
 /// Centered empty / unavailable state.
@@ -336,13 +336,42 @@ pub fn copy(text: impl Into<String>, cx: &mut App) {
 /// A window's toolbar, which is also its title bar: draggable, double-click
 /// zooms, and the traffic lights sit at its left.
 pub fn toolbar(height: f32, palette: &Palette) -> gpui_kit::component::TitleBar {
+    panel_header(height, false, palette)
+}
+
+/// Draggable title bar header; embedded right-stage views omit traffic-light padding.
+pub fn panel_header(height: f32, embedded: bool, palette: &Palette) -> gpui_kit::component::TitleBar {
     gpui_kit::component::TitleBar::new()
         .h(px(height))
-        .pl(px(crate::theme::TRAFFIC_LIGHTS))
-        .pr(px(12.))
+        .pl(px(if embedded { 16. } else { crate::theme::TRAFFIC_LIGHTS }))
+        .pr(px(if cfg!(target_os = "macos") { 14. } else { 0. }))
         .bg(palette.sidebar)
         .border_b_1()
         .border_color(palette.hairline)
+}
+
+/// Left sidebar top strip aligned with the right-stage `panel_header`.
+/// Uses `TitleBar` on macOS (no window controls, native drag + double-click zoom)
+/// and a plain drag region on Windows/Linux so caption controls render only once
+/// at the top-right corner of the window.
+pub fn sidebar_header(height: f32, palette: &Palette, content: impl IntoElement) -> AnyElement {
+    if cfg!(target_os = "macos") {
+        panel_header(height, false, palette).child(content).into_any_element()
+    } else {
+        h_flex()
+            .w_full()
+            .h(px(height))
+            .flex_none()
+            .items_center()
+            .pl(px(crate::theme::TRAFFIC_LIGHTS))
+            .pr(px(14.))
+            .bg(palette.sidebar)
+            .border_b_1()
+            .border_color(palette.hairline)
+            .window_control_area(WindowControlArea::Drag)
+            .child(content)
+            .into_any_element()
+    }
 }
 
 #[cfg(test)]

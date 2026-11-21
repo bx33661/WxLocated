@@ -1,14 +1,34 @@
-//! Unified line diff, for comparing an Agent layer with the static rebuild.
+//! Git-style patch builder and line change counter for comparing an Agent
+//! semantic layer with static reconstruction.
 
 use similar::{ChangeTag, TextDiff};
 
-pub fn unified(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
-    let diff = TextDiff::from_lines(old, new);
-    let mut output = diff.unified_diff().context_radius(4).header(old_label, new_label).to_string();
-    if output.is_empty() {
-        output = format!("--- {old_label}\n+++ {new_label}\n（两者内容相同）\n");
+/// Builds a Git-style unified patch (`--- a/...` / `+++ b/...`) for `DiffFile::parse`.
+/// Returns `None` when `old == new`.
+pub fn git_patch(path: &str, old: &str, new: &str) -> Option<String> {
+    if old == new {
+        return None;
     }
-    output
+    let normalized_old = ensure_trailing_newline(old);
+    let normalized_new = ensure_trailing_newline(new);
+    let diff = TextDiff::from_lines(normalized_old.as_ref(), normalized_new.as_ref());
+    let patch = diff
+        .unified_diff()
+        .context_radius(4)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string();
+    (!patch.trim().is_empty()).then_some(patch)
+}
+
+fn ensure_trailing_newline(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.is_empty() || text.ends_with('\n') {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        let mut owned = String::with_capacity(text.len() + 1);
+        owned.push_str(text);
+        owned.push('\n');
+        std::borrow::Cow::Owned(owned)
+    }
 }
 
 /// Lines removed and added.
@@ -27,7 +47,7 @@ pub fn counts(old: &str, new: &str) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{counts, unified};
+    use super::{counts, git_patch};
 
     #[test]
     fn counts_changed_lines() {
@@ -36,9 +56,11 @@ mod tests {
     }
 
     #[test]
-    fn unified_has_headers_or_says_identical() {
-        let diff = unified("a\n", "b\n", "静态重建", "Agent");
-        assert!(diff.contains("--- 静态重建") && diff.contains("+++ Agent") && diff.contains("-a") && diff.contains("+b"));
-        assert!(unified("x\n", "x\n", "A", "B").contains("两者内容相同"));
+    fn git_patch_parses_with_component_diff_and_handles_no_trailing_newline() {
+        assert!(git_patch("a.js", "same", "same").is_none());
+        let patch = git_patch("pages/index.js", "const a = 1;", "const a = 2;\nconst b = 3;").expect("patch");
+        let parsed = gpui_kit::component::diff::DiffFile::parse(&patch).expect("valid diff patch");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path().as_ref(), "pages/index.js");
     }
 }

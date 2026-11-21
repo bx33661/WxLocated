@@ -10,6 +10,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportRecord {
+    pub app_id: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub root: String,
+    pub exported_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -23,13 +32,19 @@ pub struct Settings {
     pub export_include_source: bool,
     /// Gallery order: `modified`, `name` or `size`.
     pub sort_order: String,
+    /// Gallery layout: `list` or `grid`.
+    pub gallery_view: String,
     /// Most recently opened first.
     pub recent_app_ids: Vec<String>,
+    /// Recent material export directories, newest first.
+    pub exported_materials: Vec<ExportRecord>,
     pub auto_scan_on_launch: bool,
     /// Rescan when WeChat writes to its cache.
     pub monitor_cache_changes: bool,
     /// `system`, `light` or `dark`.
     pub appearance: String,
+    /// Wrap long lines in code & diff views.
+    pub editor_word_wrap: bool,
     /// The file last shown in each app's window, restored when it reopens.
     pub last_files: BTreeMap<String, String>,
     /// App window panel widths, in points.
@@ -49,13 +64,16 @@ impl Default for Settings {
             export_include_raw: true,
             export_include_source: true,
             sort_order: "modified".into(),
+            gallery_view: "list".into(),
             recent_app_ids: Vec::new(),
+            exported_materials: Vec::new(),
             auto_scan_on_launch: true,
             monitor_cache_changes: true,
             appearance: "system".into(),
+            editor_word_wrap: false,
             last_files: BTreeMap::new(),
-            sidebar_width: 290.,
-            inspector_width: 290.,
+            sidebar_width: 260.,
+            inspector_width: 280.,
             gallery_frame: None,
         }
     }
@@ -67,6 +85,13 @@ impl Settings {
         self.recent_app_ids.retain(|id| id != app_id);
         self.recent_app_ids.insert(0, app_id.to_string());
         self.recent_app_ids.truncate(8);
+    }
+
+    /// Prepends an exported audit material folder (deduplicated by `root`, max 20).
+    pub fn record_export(&mut self, record: ExportRecord) {
+        self.exported_materials.retain(|existing| existing.root != record.root);
+        self.exported_materials.insert(0, record);
+        self.exported_materials.truncate(20);
     }
 }
 
@@ -166,9 +191,41 @@ mod tests {
         assert!(settings.export_include_raw && settings.export_include_source);
         assert!(settings.auto_scan_on_launch && settings.monitor_cache_changes);
         assert_eq!(settings.sort_order, "modified");
+        assert_eq!(settings.gallery_view, "list");
+        assert!(!settings.editor_word_wrap);
+        assert!(settings.exported_materials.is_empty());
         assert_eq!(settings.appearance, "system");
-        assert_eq!(settings.sidebar_width, 290.);
+        assert_eq!(settings.sidebar_width, 260.);
         assert!(settings.gallery_frame.is_none());
+    }
+
+    #[test]
+    fn record_export_deduplicates_and_bounds() {
+        let mut settings = Settings::default();
+        for i in 0..25u64 {
+            settings.record_export(ExportRecord {
+                app_id: format!("wx{i}"),
+                name: format!("App {i}"),
+                version: Some("1.0".into()),
+                root: format!("/tmp/out-{i}"),
+                exported_at: i,
+            });
+        }
+        assert_eq!(settings.exported_materials.len(), 20);
+        assert_eq!(settings.exported_materials[0].root, "/tmp/out-24");
+
+        // Re-exporting an existing path moves it back to the front without duplicating.
+        settings.record_export(ExportRecord {
+            app_id: "wx10".into(),
+            name: "App 10 Updated".into(),
+            version: Some("2.0".into()),
+            root: "/tmp/out-10".into(),
+            exported_at: 99,
+        });
+        assert_eq!(settings.exported_materials.len(), 20);
+        assert_eq!(settings.exported_materials[0].root, "/tmp/out-10");
+        assert_eq!(settings.exported_materials[0].name, "App 10 Updated");
+        assert_eq!(settings.exported_materials.iter().filter(|r| r.root == "/tmp/out-10").count(), 1);
     }
 
     #[test]

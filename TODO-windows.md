@@ -24,8 +24,11 @@
 - [x] 增加 Windows / macOS CI，以及发布 CLI 的完整冒烟测试脚本。
 - [x] 更新 README：构建依赖、运行、打包、CLI、缓存位置与存储位置。
 - [x] 避免 Windows 工具链初始化时自动安装两个 Apple 编译目标；macOS 打包按需安装目标。
+- [x] 适配 v1.2.0 单窗口双栏 AppShell 标题栏，侧栏使用独立拖拽区避免 Windows 重复绘制窗口控制按钮，并修复 Rust 1.99.1 Windows Clippy 告警。
 
 ## 已执行验证
+
+- 当前工作区自动化测试基线已扩展至 78 项（`wxlocated-engine` 62、`wxlocated-app` 13、`wxlocated-cli` 3），并在 macOS 与 GitHub Actions Windows x64 / ARM64 / macOS 三端矩阵执行 `cargo clippy --all-targets --all-features -D warnings`、`cargo test` 与打包 CLI 冒烟校验。
 
 - Windows x64 / Rust 1.99.1（仓库指定版本）：`cargo check --workspace --all-targets --all-features --locked` 通过；初期基线也在 Rust 1.100 下验证通过。
 - Windows x64：51 个引擎测试、11 个桌面端测试通过，包含中文/空格目录、超过 260 字符的扫描路径、账户识别、版本/插件隔离、JSON 脱敏和文件 URL。

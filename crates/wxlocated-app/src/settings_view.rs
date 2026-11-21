@@ -22,6 +22,15 @@ mod cli;
 
 pub use cli::cli_binary;
 
+/// Whether the `wxlocated` CLI shim is installed for the current user.
+pub fn cli_installed() -> bool {
+    let binary = cli_binary();
+    cli::shim_path()
+        .ok()
+        .and_then(|path| platform::cli_status(&path, binary.as_deref()).ok())
+        == Some(CliStatus::Installed)
+}
+
 pub const AGENT_SNIPPET: &str = "## 小程序审计材料（WxLocated）
 - `wxlocated list` 列出本机缓存的小程序（JSON）
 - `wxlocated info <appid>` 查看材料完整度（material-check schema）
@@ -213,8 +222,8 @@ impl SettingsView {
         };
         let sort_label = match sort.as_str() {
             "name" => "名称",
-            "size" => "文件大小",
-            _ => "最近修改",
+            "size" => "包体积",
+            _ => "最近活跃",
         };
         vec![
             group(
@@ -261,7 +270,7 @@ impl SettingsView {
                         &palette,
                     ),
                     row(
-                        "画廊排序",
+                        "默认排序",
                         None,
                         Button::new("sort-order")
                             .label(sort_label)
@@ -278,7 +287,7 @@ impl SettingsView {
                                             })
                                         })
                                     };
-                                    menu.item(item("最近修改", "modified")).item(item("名称", "name")).item(item("文件大小", "size"))
+                                    menu.item(item("最近活跃", "modified")).item(item("名称", "name")).item(item("包体积", "size"))
                                 }
                             })
                             .into_any_element(),
@@ -341,6 +350,7 @@ impl SettingsView {
                 .child(
                     v_flex()
                         .flex_1()
+                        .min_w_0()
                         .gap_0p5()
                         .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title))
                         .child(div().text_size(px(11.5)).text_color(palette.secondary).child(description))
@@ -350,6 +360,7 @@ impl SettingsView {
                 )
                 .child(
                     h_flex()
+                        .flex_none()
                         .gap_2()
                         .when(cfg!(target_os = "macos") && has_inaccessible, |this| {
                             this.child(Button::new("scan-privacy").label("打开隐私设置").small().on_click(|_, _, cx| {

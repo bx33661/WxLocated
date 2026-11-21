@@ -12,15 +12,20 @@
 | --- | --- |
 | Windows 10/11 · Intel / AMD | x64 便携 ZIP |
 | Windows 11 · ARM | ARM64 便携 ZIP |
-| macOS 14+ · Apple Silicon / Intel | Universal DMG |
+| macOS 14+ · Apple Silicon / Intel | Universal DMG / PKG / ZIP |
 
 [下载最新版](https://github.com/bx33661/WxLocated/releases/latest)
 
-Windows 解压后运行 `wxlocated-app.exe`，需要对应架构的 [VC++ 运行库](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)。macOS 打开 DMG，将应用拖到“应用程序”。macOS 包采用 ad-hoc 签名，尚未公证；Windows EXE 未做 Authenticode 签名。
+Windows 解压后运行 `wxlocated-app.exe`，需要对应架构的 [VC++ 运行库](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)。macOS 打开 DMG 将应用拖到“应用程序”（或使用 PKG / ZIP），应用采用 ad-hoc 签名、尚未公证；Windows EXE 未做 Authenticode 签名。所有发布包均附带 `SHA256SUMS.txt` 校验文件。
 
 macOS 首次启动如提示无法验证或已损坏，可在“系统设置 › 隐私与安全性”点击“仍要打开”，或执行 `xattr -dr com.apple.quarantine /Applications/WxLocated.app`。读取微信缓存需在“系统设置 › 隐私与安全性 › 完全磁盘访问权限”中允许 WxLocated；因使用 ad-hoc 签名，覆盖升级后若无法读取，需先从列表移除旧条目再重新添加并重启应用。
 
-启动后从画廊打开已缓存的小程序，也可拖入 `.wxapkg` 文件或包目录。工作区支持核对缺失分包和插件、对照重建与原始内容、定位来源及导出材料。未找到缓存时，可在设置中添加缓存目录。
+## 核心功能
+
+- **一体式单窗口工作台（Obsidian Studio）**：左侧导航栏快速切换「微信实时缓存」、「已导出审计材料」与最近打开的小程序，支持 `⌘O` / `⌘K`（Windows 为 `Ctrl+O` / `Ctrl+K`）快速跳转，内置浅色与深色主题。
+- **微信实时缓存捕获与焦点监控**：支持 macOS 微信 3.x / 4.0 / 4.2 多账号路径与 Windows 3.x / 4.x 缓存路径；首页焦点卡实时追踪当前活跃小程序的主包与分包捕获进度，缺包时提示在微信触发对应页面并支持一键导出复制 Agent 指令；也支持单击列表/卡片切换，或直接拖入/选择本地 `.wxapkg` 文件与重建层目录。
+- **三页签源码工作区**：顶部划分 `源码与搜索`、`分包监控` 与 `Agent 交付与证据`；浏览页面时支持 `JS 逻辑 | WXML 结构 | WXSS 样式 | JSON 配置` 四件套一键切换，提供按页面/目录树/`⇧⌘F` 跨文件全文搜索、多文件标签页、前进后退历史、自动换行与底部字节证据栏。
+- **Agent 交付与彩色对照**：导出自包含审计材料并记录到「已导出审计材料」中心，一键复制可直接粘贴给 Claude Code / Cursor / Codex 的审计提示词；支持导入外部 Agent 重建层并通过原生语法高亮红绿 Diff 对照差异。未找到缓存时，可在设置中添加自定义扫描目录。
 
 ![WxLocated 源码工作区，使用示例小程序展示](design/wxlocated-rust-workspace.png)
 
